@@ -26,6 +26,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/session_restore_reclaim.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -736,6 +737,9 @@ struct Options {
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
     bool session_save_reclaim = false;
+    /// --serve RESTORE: evict parked conversations when the file does not fit in RAM, before refusing it.  -1 = unset
+    /// (STRATA_SESSION_RESTORE_RECLAIM=0 turns it off, else on); --no-session-restore-reclaim = 0, the flag wins.
+    int session_restore_reclaim = -1;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
@@ -891,6 +895,8 @@ void usage() {
                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
+                 "  --no-session-restore-reclaim  --serve: refuse a RESTORE that needs RAM instead of first evicting\n"
+                 "                       unpinned parked conversations (also STRATA_SESSION_RESTORE_RECLAIM=0)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
@@ -2620,6 +2626,7 @@ int main(int argc, char** argv) {
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
+        else if (a == "--no-session-restore-reclaim") o.session_restore_reclaim = 0;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
@@ -2883,6 +2890,10 @@ int main(int argc, char** argv) {
         }
     }
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
+    if (o.session_restore_reclaim < 0) {   // --no-session-restore-reclaim, else STRATA_SESSION_RESTORE_RECLAIM, else on
+        const char* env = std::getenv("STRATA_SESSION_RESTORE_RECLAIM");
+        o.session_restore_reclaim = env != nullptr && std::strcmp(env, "0") == 0 ? 0 : 1;
+    }
     {   // the RAM guard (parking, session save/restore): --memory-limit-mib, else STRATA_MEMORY_LIMIT_MIB, else none
         int64_t mib = o.memory_limit_mib;
         if (mib < 0) {
@@ -12057,7 +12068,15 @@ int main(int argc, char** argv) {
                         strata::core::SessionReadLimits limits;
                         limits.progress = moving;
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
-                        limits.admit = [floor, &o](uint64_t need, std::string& why) {
+                        limits.admit = [floor, &o, &conversations](uint64_t need, std::string& why) {
+                            if (o.session_restore_reclaim > 0) {
+                                // after the header and identity checks: free parked conversations before refusing
+                                const auto freed = strata::core::session_restore_reclaim(
+                                    conversations, need, floor, strata::core::available_host_bytes);
+                                if (freed.bytes || freed.parked)
+                                    std::fprintf(stderr, "strata serve: restore reclaimed %zu parked, %zu host bytes; "
+                                                         "checking RAM again\n", freed.parked, freed.bytes);
+                            }
                             const auto mem = strata::core::sample_host_memory();
                             const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;

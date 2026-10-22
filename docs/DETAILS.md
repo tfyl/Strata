@@ -1360,7 +1360,19 @@ pressure still returns the last refusal. The wait is outside the engine's report
 This can trade later prefix-cache hits for room to save. Released caches stay released even if admission or file
 I/O later fails; the current tokens, images, steering and live device state are unchanged. It cannot guarantee a
 SAVE under arbitrary memory pressure. With the option off, or enough RAM at the first probe, cache retention and
-the session file format are unchanged. RESTORE is unchanged.
+the session file format are unchanged. RESTORE is unchanged by this option.
+
+A RESTORE whose file does not fit its RAM preflight (the parse's peak plus `--conversation-cache-min-free-mib`)
+first releases the retained K/V buffers and then the oldest parked conversations, one at a time, measuring
+available RAM after each and stopping as soon as the restore fits; it is refused only if it still does not fit.
+This runs after the file's header, model and configuration fingerprints are checked, so a file of another model is
+refused without evicting anything, but before the payload hash, so a corrupt payload can still cost parked
+conversations. Pinned conversations stay parked, and the live session and its checkpoints are not touched: a
+refused or failed restore leaves them as they were, and they are only freed once the restore has replaced them, so
+they do not count towards the room the read needs. Unknown RAM telemetry or an unknown estimate evicts nothing. The
+engine logs `restore reclaimed N parked, B host bytes` when it evicts. It is on by default;
+`--no-session-restore-reclaim` (an engine argument in the config's `args`) or `STRATA_SESSION_RESTORE_RECLAIM=0`
+turns it off. Unlike a SAVE with `--session-save-reclaim`, the server does not wait or retry a refused RESTORE.
 
 The request must be `Content-Type: application/json` (else `415`) and come from no browser page, Strata's own or a
 trusted origin (another site's `Origin` gets `403`, also with an API key); the Host and API-key checks apply as
