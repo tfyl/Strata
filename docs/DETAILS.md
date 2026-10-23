@@ -697,7 +697,8 @@ extra RAM):
   on unless that variable is `0`). An agent that forks a side request off its history leaves its path 3 tokens into
   the newest user message, past the turn header and the periodic checkpoints, so without this the main line read from
   token 0 (38-185K tokens in Hermes' traffic). A tool result (`<tool_response>`, `--tool-response-token`, default
-  248066) gets the rotating kind: a tool loop makes one per request. Any other message is an ordinary checkpoint.
+  248066) gets the rotating kind: a tool loop makes one per request. Any other message's checkpoint (the newest
+  only) is kept like a `pin=N` prefix while a side request runs: the main line comes back to exactly its start.
 - *Branch points* (`--branch-checkpoint-grain N`, default 256, `0` = off): a prompt that follows a held path (the live
   session or a parked conversation) at least 2,048 tokens past where it can resume is read to where it leaves that
   path, rounded down to N, and checkpointed there. The newest branch checkpoint is kept like a `pin=N` prefix. The
