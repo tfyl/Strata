@@ -150,6 +150,21 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(session_resume_only_test src/core/session_resume_only_test.cpp src/core/conversation_file.cpp)
   target_include_directories(session_resume_only_test PRIVATE include)
   add_test(NAME session_resume_only_test COMMAND session_resume_only_test)
+  # tfyl: the disk tier's store (CPU, a temporary directory)
+  if(NOT WIN32)
+    add_executable(kvstore_test src/core/kvstore_test.cpp src/core/kvstore.cpp src/core/conversation_file.cpp)
+    target_include_directories(kvstore_test PRIVATE include)
+    add_test(NAME kvstore_test COMMAND kvstore_test)
+  endif()
+  # tfyl: the disk tier end to end on the host - the real snapshot code against host pools, the CUDA runtime a stub
+  # in the test itself, so it needs the CUDA headers only (-DSTRATA_TIER_TEST_CUDA_INCLUDE=<cuda>/include), no GPU
+  if(NOT WIN32 AND STRATA_TIER_TEST_CUDA_INCLUDE)
+    add_executable(conversation_tier_test src/core/conversation_tier_test.cpp src/core/conversation_tier.cpp
+      src/core/kvstore.cpp src/core/conversation_state.cpp src/core/conversation_snapshot.cpp src/core/conversation_file.cpp)
+    target_include_directories(conversation_tier_test PRIVATE include ${STRATA_TIER_TEST_CUDA_INCLUDE})
+    target_compile_definitions(conversation_tier_test PRIVATE STRATA_VERSION="test")
+    add_test(NAME conversation_tier_test COMMAND conversation_tier_test)
+  endif()
 endif()
 
 if(STRATA_HIP_GFX906)
@@ -587,7 +602,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
-    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
+    src/core/kvstore.cpp src/core/conversation_tier.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)

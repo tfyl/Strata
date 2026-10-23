@@ -226,6 +226,32 @@ class ConversationCacheCard(unittest.TestCase):
             self.assertEqual(c.poll(str(log), log.stat().st_size)["parked"], 0)   # the engine started again
             self.assertEqual(c.poll(None, None)["parked"], 0)
 
+    def test_the_kv_store_line(self):
+        """tfyl: the disk tier's counters from its log line, last line wins; an error line is not counters."""
+        from serve.server import ConvCacheLog
+        from serve import prometheus
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text("", encoding="utf-8")
+            c = ConvCacheLog()
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("strata serve: kv store persisted; kv store: records=3 chunks=2 snapshots=1 disk_bytes=4096 "
+                        "segments=1 chunk_writes=2 rewrite_differ=0 restore_ms=0.0 waiting=1\n")
+                f.write("strata serve: kv store: cannot write /x: No space left on device\n")
+                f.write("strata serve: kv store restored; kv store: records=3 chunks=2 snapshots=1 disk_bytes=4096 "
+                        "segments=1 chunk_writes=2 rewrite_differ=1 restores=1 restore_ms=412.5 waiting=0\n")
+            kv = c.poll(str(log), 0)["kv_store"]
+            self.assertEqual((kv["chunks"], kv["restores"], kv["rewrite_differ"], kv["waiting"]), (2, 1, 1, 0))
+            self.assertEqual(kv["restore_ms"], 412.5)
+            out = []
+            prometheus.strata({"conversation_cache": {"kv_store": kv}}, out, 'model="m"')
+            text = "\n".join(out)
+            self.assertIn('strata:kv_store_chunks{model="m"} 2', text)
+            self.assertIn("# TYPE strata:kv_store_chunks gauge", text)
+            self.assertIn('strata:kv_store_restores_total{model="m"} 1', text)
+            self.assertIn("# TYPE strata:kv_store_rewrite_differ_total counter", text)
+
     def test_metrics(self):
         tok = ByteTokenizer()
         engine = MockEngine(tok, "Thought.</think>\nHello.", max_context=4096)

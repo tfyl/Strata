@@ -1400,6 +1400,37 @@ state and the tail's K/V bought nothing on disk. The file is a session file like
 checkpoints of its own); `n_saved` is the checkpoint's length, and its RAM preflight is one checkpoint copy instead of
 two plus the live state. A longer tail, no checkpoint, or `--session-resume-only -1` saves as upstream.
 
+**The disk tier (tfyl fork, `--kv-store DIR`).** The engine keeps conversations on disk itself, beside the RAM cache,
+in one content-addressed store (no proxy, no whole-session files):
+
+- *Chunks.* A conversation's K/V is cut into 256-token chunks, keyed by a chained hash: the key after j chunks
+  hashes the key after j - 1 with the chunk's token ids, starting from a seed of everything the bytes depend on (the
+  session file's model and config fingerprints, the geometry, the layer carve, every K/V part's format, the
+  steering mode). A shared prefix - a system prompt, an earlier turn, a fork - is stored once. After each request
+  the chunks below its deepest checkpoint that the store does not hold are written; that happens before the engine
+  reads its next command, so it never delays the answer. A chunk the request read again (cells it rewrote) that
+  the store already holds is compared and not written: the first writer stays (`rewrite_same` / `rewrite_differ`).
+- *Snapshots.* A checkpoint's running state (~118 MB) is stored with the tokens past its whole chunks and their K/V.
+  Only when it is `--kv-store-min-gain` tokens (4096) past the stored one on its path, or a kept point (a branch
+  point, the newest user message, a pin). It waits in RAM, where the conversation's next turn resumes from it
+  anyway, and is written when its conversation leaves the session (a request of another one), when retention drops
+  it, after `--kv-store-idle-s` (300) without requests (the server asks once a minute: `KVSTORE IDLE`), at QUIT, or
+  at once when RAM is short (under `--conversation-cache-min-free-mib` plus two snapshots). A crash loses only the
+  ones still waiting.
+- *Restore.* A request whose prompt matches nothing in RAM as deep as the store's deepest snapshot on its path (by
+  1/64 of it, 256 tokens at least) restores from disk: the chunks and the snapshot's tail into the K/V pools (in
+  32 MiB batches, one copy per layer part), its running state as the checkpoint the request resumes from. The
+  outgoing conversation parks in RAM as before. A read or digest failure reads the prompt from token 0.
+- *On disk.* Append-only `seg-NNNNNNNN.kvs` files of at most 256 MiB, records written with O_DIRECT (no page cache)
+  and no fsync per record: a digest on every header and payload finds a torn write after a crash, and the store
+  drops it when it opens (it rebuilds its index by scanning the headers). Over `--kv-store-gib` (100) the oldest
+  segment is deleted; what was read or matched since it was written is copied forward once.
+- *Limits.* One GPU, `--prompt-cache` > 0, no `--batch` or `--peer-device`, text only (a conversation with pictures
+  is not stored). POSIX only (off on Windows). RAM: a 32 MiB staging buffer, a 16 MiB I/O buffer and ~150 bytes a
+  record for the index. The session file commands (SAVE / RESTORE) still export and import single conversations.
+- *Metrics.* After each operation the engine logs `kv store: k=v ...`; the server's `/metrics` carries it under
+  `conversation_cache.kv_store` and as `strata:kv_store_*`. `KVSTORE STATS` / `KVSTORE FLUSH` answer the same.
+
 The request must be `Content-Type: application/json` (else `415`) and come from no browser page, Strata's own or a
 trusted origin (another site's `Origin` gets `403`, also with an API key); the Host and API-key checks apply as
 everywhere. Errors: `501` without `--slot-save-path` or with parallel requests; `400` for a slot other than 0, an unknown action, a refused

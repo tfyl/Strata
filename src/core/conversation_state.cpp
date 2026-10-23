@@ -348,6 +348,24 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     return true;
 }
 
+bool conversation_kv_lanes(const SessionState& ss, const ModelGeometry& g, const QsaState* draft,
+                           std::vector<ConversationKvLane>& lanes, std::string& error) {
+    lanes.clear();
+    auto add = [&](const QsaState& st, bool index) {
+        ConversationKvStrides s;
+        if (!conversation_kv_strides(st, g, index, s, error)) return false;
+        for (int p = 0; p < 5; ++p)
+            if (s.per[(size_t) p])
+                lanes.push_back({&st, index, p, s.format, s.per[(size_t) p], p == 4 ? s.row_cells : 0});
+        return true;
+    };
+    if (owned_qsa(ss) && !ss.qsa_states) return fail(error, "missing QSA states");
+    for (size_t j = 0; j < owned_qsa(ss); ++j)
+        if (!add(owned(ss, j), true)) return false;
+    if (draft && !add(*draft, false)) return false;
+    return true;
+}
+
 bool conversation_snapshot_sources_at(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                       const ConversationCheckpoint& resume, bool cvec, const SessionState& ss,
                                       const ModelGeometry& g, const QsaState& draft, std::string& error) {

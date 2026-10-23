@@ -743,6 +743,8 @@ class ConvCacheLog:
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+    # tfyl: the disk tier (--kv-store): "strata serve: <what>; kv store: k=v k=v ..." after each of its operations
+    KV_STORE = re.compile(r"kv store: ((?:[a-z_]+=[-0-9.]+ ?)+)$")
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
@@ -775,6 +777,18 @@ class ConvCacheLog:
         self.pos += end
         now = time.time()
         for line in data[:end].decode("utf-8", "replace").splitlines():
+            if "kv store: " in line:
+                m = self.KV_STORE.search(line)
+                if m:
+                    kv = {}
+                    for pair in m.group(1).split():
+                        k, _, v = pair.partition("=")
+                        try:
+                            kv[k] = float(v) if "." in v else int(v)
+                        except ValueError:
+                            pass
+                    self.state["kv_store"] = kv
+                continue
             if "conversation cache:" not in line:
                 continue
             m = self.EVENT.search(line)
@@ -1362,6 +1376,37 @@ class StrataEngine:
                 return out
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
+
+    def kvstore(self, cmd: str = "IDLE", timeout: float = 600.0) -> dict:
+        """tfyl: `KVSTORE IDLE|FLUSH|STATS` between requests (the caller holds the service's FIFO): the disk tier
+        (--kv-store) writes the snapshots that waited in RAM past --kv-store-idle-s (FLUSH: all of them now).
+        -> its counters; {"off": 1} when the engine runs without it."""
+        if not self.alive():
+            raise EngineDied("the engine is not running")
+        self.proc.stdin.write(f"KVSTORE {cmd}\n")
+        self.proc.stdin.flush()
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer the KVSTORE command") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or "the engine refused the KVSTORE command")
+            if line.startswith("KVSTORE "):
+                out = {}
+                for kv in line.split()[1:]:
+                    k, _, v = kv.partition("=")
+                    try:
+                        out[k] = float(v) if "." in v else int(v)
+                    except ValueError:
+                        out[k] = v
+                return out
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer the KVSTORE command")
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -4296,6 +4341,30 @@ class Service:
                     self.unload(idle_for=self.idle_unload_s)
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
                     print(f"[strata] idle unload: {e}", flush=True)
+        threading.Thread(target=loop, daemon=True).start()
+
+    def start_kv_store_idle(self):
+        """tfyl: with the disk tier (--kv-store in the engine's args) the engine is asked once a minute, between
+        requests, to write the snapshots that have waited in RAM past --kv-store-idle-s (KVSTORE IDLE).  A request
+        that holds the FIFO is never waited for: the next minute tries again."""
+        args = self.engine.spawn[1] if hasattr(self.engine, "spawn") else []
+        if "--kv-store" not in args or not hasattr(self.engine, "kvstore"):
+            return
+
+        def loop():
+            while True:
+                time.sleep(60.0)
+                if not self.fifo.acquire(blocking=False):
+                    continue
+                try:
+                    if self.loaded() and not getattr(self.engine, "batch", 0):
+                        self.engine.kvstore("IDLE")
+                except (ValueError, EngineDied) as e:
+                    print(f"[strata] kv store idle flush: {e}", flush=True)
+                except Exception as e:                  # tried again next minute; the thread keeps running
+                    print(f"[strata] kv store idle flush: {e}", flush=True)
+                finally:
+                    self.fifo.release()
         threading.Thread(target=loop, daemon=True).start()
 
     def set_shared(self, defaults) -> dict:
@@ -8385,6 +8454,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     bound_port = httpd.server_address[1]               # --port 0: report the port the OS actually assigned
     svc.start_idle_unload()
     svc.start_vision_idle()
+    svc.start_kv_store_idle()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{bound_port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"

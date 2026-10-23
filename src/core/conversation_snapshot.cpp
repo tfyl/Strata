@@ -284,6 +284,54 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
     return refresh_residency(st, g, upto, error);
 }
 
+bool conversation_kv_strides(const QsaState& st, const ModelGeometry& g, bool index, ConversationKvStrides& s,
+                             std::string& error) {
+    const auto shapes = strata::kernels::qsa_real_shapes();
+    const int64_t probe = std::max<int64_t>(shapes.page_size, shapes.idx_block) * 64;
+    Layout l{};
+    if (!layout(st, g, std::min<int64_t>(probe, st.max_cells), index, l, error)) return false;
+    if (l.cells <= 0) { error = "conversation snapshot: no K/V cells"; return false; }
+    s = {};
+    s.format = l.format;
+    s.page = l.page_size;
+    s.row_cells = index ? shapes.idx_block : 0;
+    // the parts as conversation_kv_save takes them (k, v, k_scale, v_scale per cell; the pooled indexer per row)
+    s.per = {l.data / (size_t) l.cells, l.value_data / (size_t) l.cells, l.scales / (size_t) l.cells,
+             l.value_scales / (size_t) l.cells, index ? (size_t) g.idx_key_dim * sizeof(float) : 0};
+    return true;
+}
+
+namespace {
+bool cell_range(const QsaState& st, const ConversationKvStrides& s, int64_t cell0, int64_t n, std::string& error) {
+    if (cell0 < 0 || n <= 0 || cell0 + n > st.max_cells || cell0 % s.page || n % s.page ||
+        (s.row_cells && (cell0 % s.row_cells || n % s.row_cells))) {
+        error = "conversation snapshot: invalid K/V cell range";
+        return false;
+    }
+    return true;
+}
+}  // namespace
+
+bool conversation_kv_part_cells(const QsaState& st, const ModelGeometry& g, bool index, int part, int64_t cell0,
+                                int64_t n, void* host, bool to_pool, std::string& error) {
+    ConversationKvStrides s;
+    if (part < 0 || part > 4) { error = "conversation snapshot: no such K/V part"; return false; }
+    if (!conversation_kv_strides(st, g, index, s, error) || !cell_range(st, s, cell0, n, error)) return false;
+    if (!s.per[(size_t) part]) return true;
+    Layout l{};
+    if (!layout(st, g, cell0 + n, index, l, error) || !valid(st, l, cell0 + n, error)) return false;
+    uint8_t* pool = static_cast<uint8_t*>(pools(st)[(size_t) part]);
+    const bool row = part == 4;
+    const uint64_t at = (uint64_t) (row ? cell0 / s.row_cells : cell0) * s.per[(size_t) part];
+    const uint64_t len = (uint64_t) (row ? n / s.row_cells : n) * s.per[(size_t) part];
+    return to_pool ? transfer(pool ? pool + at : nullptr, host, len, error)
+                   : transfer(host, pool ? pool + at : nullptr, len, error);
+}
+
+bool conversation_kv_refresh(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
+    return refresh_residency(st, g, upto, error);
+}
+
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
                                 std::array<uint64_t, 5>& sizes, std::string& error) {
     Layout l{};
