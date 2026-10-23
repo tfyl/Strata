@@ -155,6 +155,12 @@ def strata(m: dict, out: list, lab: str):
                              ("gpu_power_watts", "power", "GPU power draw (hardware.gpu_power).")):
         for g in gpus:                                   # a family's samples together, one per card
             metric(name, "gauge", help_, g.get(key), f',gpu="{g.get("index")}"')
+    # tfyl: the conversation cache's disk tier (--kv-store), as the engine's log reports it
+    kv = ((m.get("conversation_cache") or {}).get("kv_store")) or {}
+    gauges = {"records", "chunks", "snapshots", "disk_bytes", "segments", "waiting"}
+    for k in sorted(kv):
+        metric(f"kv_store_{k}" + ("" if k in gauges else "_total"), "gauge" if k in gauges else "counter",
+               f"The disk tier's {k.replace('_', ' ')} (conversation_cache.kv_store.{k}).", kv.get(k))
     metric("cpu", "gauge", "CPU busy, percent (hardware.cpu).", hw.get("cpu"))
     metric("ram_used_bytes", "gauge", "RAM in use (hardware.ram_used).", hw.get("ram_used"))
     metric("ram_total_bytes", "gauge", "RAM (hardware.ram_total).", hw.get("ram_total"))

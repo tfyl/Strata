@@ -37,6 +37,37 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
 // restore followed by a rewind to a checkpoint.
 bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                                     int64_t captured, int64_t upto, bool include_index, std::string& error);
+// tfyl (the disk tier, kvstore.hpp): a layer's identity layout as byte strides - k, v, k_scale and v_scale per cell
+// (0: the format has no such part), the pooled indexer per row of `row_cells` cells (0 without the index) - and the
+// page every range must be a multiple of.  The same bytes conversation_kv_save takes, cut by cells.
+struct ConversationKvStrides {
+    int format = 0;
+    int64_t page = 0, row_cells = 0;
+    std::array<size_t, 5> per{};
+};
+bool conversation_kv_strides(const QsaState& state, const ModelGeometry& g, bool include_index,
+                             ConversationKvStrides& strides, std::string& error);
+// One part of cells [cell0, cell0 + n) (multiples of the page and the indexer row) of the authoritative pools, to or
+// from `host` (per[part] * n bytes; the pooled part per[4] * n / row_cells).  A synchronous copy; a part the format
+// does not have is nothing.  Out of the pools: the caller has synchronized the device.  Into them:
+// conversation_kv_refresh once after the last range, before attention reads them; a failure leaves the pools partly
+// written (the caller then reads the prompt from token 0).
+bool conversation_kv_part_cells(const QsaState& state, const ModelGeometry& g, bool include_index, int part,
+                                int64_t cell0, int64_t n, void* host, bool to_pool, std::string& error);
+// Every part of every K/V layer a session owns, in order (its QSA layers with their indexer, then the draft layer -
+// nullptr: none): a chunk of n cells is these lanes' bytes for n cells, one after another.
+struct ConversationKvLane {
+    const QsaState* state = nullptr;
+    bool index = false;
+    int part = 0, format = 0;
+    size_t per = 0;          // bytes per cell (the pooled part: per indexer row)
+    int64_t row_cells = 0;   // the pooled part's cells per row (0: a per-cell part)
+    size_t bytes(int64_t cells) const { return per * (size_t) (row_cells ? cells / row_cells : cells); }
+};
+bool conversation_kv_lanes(const SessionState& session, const ModelGeometry& g, const QsaState* draft,
+                           std::vector<ConversationKvLane>& lanes, std::string& error);
+// The VRAM slots of a streamed state refilled for a conversation of `upto` tokens (as after a restore).
+bool conversation_kv_refresh(const QsaState& state, const ModelGeometry& g, int64_t upto, std::string& error);
 // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.
