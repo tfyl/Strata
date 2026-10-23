@@ -765,6 +765,11 @@ struct Options {
     /// snapshot stays in RAM without requests, and the shortest conversation stored
     std::string kv_store;
     int64_t kv_store_gib = 100, kv_store_min_gain = 4096, kv_store_idle_s = 300, kv_store_min_tokens = 0;
+    /// --serve (tfyl, stage 3): a conversation the disk tier keeps leaves the session as running states in a RAM
+    /// pool (at most kv_store_pool_mib, sized from MemAvailable, spilled to disk under pressure) instead of a parked
+    /// K/V image; --kv-store-ram-park parks the image as well, --kv-store-no-pool goes back to stage 2
+    bool kv_store_pool = true, kv_store_ram_park = false;
+    int64_t kv_store_pool_mib = 1536;
     /// --serve (#458, opt-in): the role token of a short turn the server puts right before the new assistant turn
     /// (the "system" of a trailing reasoning-effort turn).  When the turn before the last <|im_start|> opens with it,
     /// the checkpoint goes in front of that turn instead, so it holds the conversation and not the effort text.
@@ -953,6 +958,11 @@ void usage() {
                  "  --kv-store-idle-s N  a snapshot waiting in RAM goes to disk after N s without requests (default\n"
                  "                       300; at once when RAM is short, and when its conversation leaves the session)\n"
                  "  --kv-store-min-tokens N  conversations shorter than N tokens are not stored (default 0)\n"
+                 "  --kv-store-pool-mib N  a stored conversation that leaves the session keeps its resume states in a\n"
+                 "                       RAM pool of at most N MiB (default 1536), less when MemAvailable is short (it\n"
+                 "                       spills to disk, keeping 2), instead of a parked K/V image\n"
+                 "  --kv-store-no-pool   no pool: park as before and write those states to disk at the switch\n"
+                 "  --kv-store-ram-park  the pool and the parked K/V image both\n"
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
@@ -2697,6 +2707,9 @@ int main(int argc, char** argv) {
         else if (a == "--kv-store-min-gain") o.kv_store_min_gain = std::max(0LL, std::atoll(next("--kv-store-min-gain")));
         else if (a == "--kv-store-idle-s") o.kv_store_idle_s = std::max(0LL, std::atoll(next("--kv-store-idle-s")));
         else if (a == "--kv-store-min-tokens") o.kv_store_min_tokens = std::max(0LL, std::atoll(next("--kv-store-min-tokens")));
+        else if (a == "--kv-store-no-pool") o.kv_store_pool = false;
+        else if (a == "--kv-store-ram-park") o.kv_store_ram_park = true;
+        else if (a == "--kv-store-pool-mib") o.kv_store_pool_mib = std::max(0LL, std::atoll(next("--kv-store-pool-mib")));
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
@@ -9387,6 +9400,13 @@ int main(int argc, char** argv) {
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            // tfyl (stage 3): a conversation the disk tier keeps left its K/V on disk and its resume states in the
+            // tier's RAM pool (the admission's leave(), just before this): no K/V image in RAM as well
+            if (kv_tier.covers((int64_t) live.size()) && !o.kv_store_ram_park && live_imgs.empty()) {
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (%zu tokens: the kv store keeps "
+                                     "it; parked=%zu)\n", live.size(), conversations.size());
+                return true;
+            }
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
             // Named, so a stall report says "parking"; its copies beat (conversation_copy.hpp), so the watchdog
@@ -11887,6 +11907,8 @@ int main(int argc, char** argv) {
                 to.min_gain = o.kv_store_min_gain;
                 to.idle_s = o.kv_store_idle_s;
                 to.floor_bytes = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                to.pool = o.kv_store_pool;
+                to.pool_max = (uint64_t) o.kv_store_pool_mib << 20;
                 if (!kv_tier.open(to, identity, e)) std::fprintf(stderr, "strata serve: --kv-store is off: %s\n", e.c_str());
                 else tier_log("kv store open");
             }
@@ -11909,8 +11931,10 @@ int main(int argc, char** argv) {
                 tier_after = false;
                 std::string e;
                 const auto mem = strata::core::sample_host_memory();
-                if (live_ok && !kv_tier.after_request(ss, g, tier_draft, cvec_cached, live, checks, tier_from,
-                                                      mem ? std::optional<uint64_t>(mem->available) : std::nullopt, e))
+                const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                if (live_ok && !kv_tier.after_request(ss, g, tier_draft, cvec_cached, live, checks, tier_from, avail, e))
+                    std::fprintf(stderr, "strata serve: kv store: %s\n", e.c_str());
+                if (e.clear(), !kv_tier.trim(avail, e))   // stage 3: the pool to what RAM allows now
                     std::fprintf(stderr, "strata serve: kv store: %s\n", e.c_str());
                 tier_log("kv store persisted");
             }
@@ -11966,7 +11990,11 @@ int main(int argc, char** argv) {
             // KVSTORE <the stats line's k=v pairs>
             if (line.rfind("KVSTORE", 0) == 0) {
                 if (kv_tier.on() && !batch_on()) {
-                    if (line == "KVSTORE FLUSH" || (line == "KVSTORE IDLE" && kv_tier.idle_due())) tier_flush("kv store flushed");
+                    if (line == "KVSTORE FLUSH" || (line == "KVSTORE IDLE" && kv_tier.idle_due())) {
+                        tier_flush("kv store flushed");
+                        std::string e;   // stage 3: the pool's states that only RAM holds (IDLE: the ones past idle_s)
+                        if (!kv_tier.save_pool(line == "KVSTORE IDLE", e)) std::fprintf(stderr, "strata serve: kv store: %s\n", e.c_str());
+                    }
                     const std::string s = kv_tier.stats_line();
                     std::printf("KVSTORE %s\n", s.c_str() + std::min(s.size(), s.find(':') + 2));
                 } else {
@@ -11975,7 +12003,12 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
-            if (line == "QUIT") tier_flush("kv store flushed at QUIT");
+            if (line == "QUIT" && kv_tier.on()) {
+                tier_flush("kv store flushed at QUIT");
+                std::string e;
+                if (!kv_tier.save_pool(false, e)) std::fprintf(stderr, "strata serve: kv store: %s\n", e.c_str());
+                tier_log("kv store saved at QUIT");
+            }
             // a command may touch the expert cache (a request lends slots, a K/V growth moves them, a session restore
             // quiesces it): a round of the asynchronous tier that the batch windows left in flight lands first
             if (!adapt_tick(true)) {
@@ -12780,11 +12813,35 @@ int main(int argc, char** argv) {
                                          : 0;
             const bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
                                     (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain;
-            // tfyl: before anything overwrites the pools, the outgoing conversation's waiting snapshots go to disk -
-            // all of them when another conversation comes in, else the ones past where this request rewrites
-            if (kv_tier.waiting())
-                tier_flush("kv store flushed (the session leaves those checkpoints)",
-                           incoming || borrow || use_store || slot_source >= 0 ? 0 : resume);
+            // tfyl: before anything overwrites the pools, the outgoing conversation's waiting snapshots are kept - all
+            // of them when another conversation comes in, else the ones past where this request rewrites.  Stage 3
+            // (the pool): they move into RAM with their tail cells, and at a switch the live tip joins them, so the
+            // conversation comes back exactly where it left without a parked K/V image (its chunks are on disk).
+            // Without the pool they go to disk.
+            if (kv_tier.on()) {
+                const bool switching = incoming || borrow || use_store || slot_source >= 0;
+                const auto mem = strata::core::sample_host_memory();
+                const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                std::string e;
+                bool ok = true;
+                if (switching && o.kv_store_pool && live_ok && live_imgs.empty() && kv_tier.covers((int64_t) live.size())) {
+                    ConvCheckpoint tip;
+                    tip.ids = live;
+                    if (gpu_sync_ok() && checkpoint_save(tip, ss, g))
+                        ok = kv_tier.leave(ss, g, tier_draft, cvec_cached, live, checks, std::move(tip), avail, e);
+                    else
+                        ok = kv_tier.adopt(ss, g, tier_draft, cvec_cached, live, checks, 0, avail, e);
+                    tier_log("kv store: the session left the conversation");
+                } else if (kv_tier.waiting_above(switching ? 0 : resume)) {
+                    ok = live_ok && kv_tier.adopt(ss, g, tier_draft, cvec_cached, live, checks, switching ? 0 : resume,
+                                                  avail, e);
+                    tier_log("kv store: kept the checkpoints this request rewrites");
+                }
+                if (!ok) {
+                    if (!e.empty()) std::fprintf(stderr, "strata serve: kv store: %s\n", e.c_str());
+                    kv_tier.forget();
+                }
+            }
             if (borrow && !pin_sibling && park_worth) {
                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
                 const bool parked_ok = park_current(0);

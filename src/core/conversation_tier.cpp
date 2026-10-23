@@ -238,7 +238,159 @@ bool ConversationTier::spill(const SessionState& ss, const ModelGeometry& g, con
 }
 
 bool ConversationTier::idle_due() const {
-    return !pending_.empty() && Clock::now() - last_request_ >= std::chrono::seconds(std::max<int64_t>(opt_.idle_s, 0));
+    const auto idle = std::chrono::seconds(std::max<int64_t>(opt_.idle_s, 0));
+    if (!pending_.empty() && Clock::now() - last_request_ >= idle) return true;
+    for (const auto& e : pool_)
+        if (!e.on_disk && Clock::now() - e.since >= idle) return true;
+    return false;
+}
+
+uint64_t ConversationTier::pool_bytes() const {
+    uint64_t n = 0;
+    for (const auto& e : pool_) n += e.bytes();
+    return n;
+}
+
+bool ConversationTier::put_entry(const PoolEntry& e, std::string& error) {
+    const ConversationCheckpoint& c = e.state;
+    const std::vector<kvstore::Piece> pieces = {{c.gdn.data(), c.gdn.size()}, {c.ple.data(), c.ple.size()},
+                                                {c.tails.data(), c.tails.size()}, {c.dead.data(), c.dead.size()},
+                                                {c.block_pos.data(), c.block_pos.size()},
+                                                {e.tail_kv.data(), e.tail_kv.size()}};
+    if (!store_.put_snapshot(e.at, e.tokens, e.tail, c.branch ? kvstore::kFlagBranch : 0, pieces, error)) return false;
+    ++c_.snapshot_writes;
+    return true;
+}
+
+const ConversationTier::PoolEntry* ConversationTier::pool_best(const std::vector<kvstore::Key>& keys,
+                                                               const std::vector<int32_t>& prompt, bool cvec,
+                                                               size_t whole) const {
+    const PoolEntry* best = nullptr;
+    for (const auto& e : pool_) {
+        if (e.cvec != cvec || e.tokens >= (int64_t) prompt.size()) continue;
+        const size_t j = (size_t) ((e.tokens - (int64_t) e.tail.size()) / kChunk);
+        if (j > whole || j >= keys.size() || keys[j] != e.at) continue;
+        if (!std::equal(e.tail.begin(), e.tail.end(), prompt.begin() + (std::ptrdiff_t) (j * (size_t) kChunk))) continue;
+        if (!best || e.tokens > best->tokens) best = &e;
+    }
+    return best;
+}
+
+bool ConversationTier::adopt(const SessionState& ss, const ModelGeometry& g, const QsaState* draft, bool cvec,
+                             const std::vector<int32_t>& ids, std::vector<ConversationCheckpoint>& checks,
+                             int64_t above, std::optional<uint64_t> available, std::string& error) {
+    if (!opt_.pool) return flush(ss, g, draft, cvec, ids, checks, error, above);
+    if (!on()) return true;
+    if (!waiting_above(above)) return trim(available, error);
+    if (!ensure_staging(error) || !device_idle(error)) return false;
+    const auto keys = kvstore::chain_keys(seed(cvec), ids.data(), ids.size());
+    std::vector<ConversationKvLane> lanes;
+    if (!conversation_kv_lanes(ss, g, draft, lanes, error)) return false;
+    const int64_t page = page_of(lanes, g);
+    std::vector<int64_t> keep;
+    std::vector<size_t> moved;
+    for (const int64_t L : pending_) {
+        if (L <= above) { keep.push_back(L); continue; }
+        size_t found = checks.size();
+        for (size_t i = 0; i < checks.size(); ++i)
+            if ((int64_t) checks[i].ids.size() == L && checks[i].ids.size() <= ids.size() &&
+                std::equal(checks[i].ids.begin(), checks[i].ids.end(), ids.begin())) found = i;
+        if (found == checks.size() || !checks[found].imgs.empty() || !checks[found].stage_parts.empty() ||
+            L / kChunk >= (int64_t) keys.size()) { ++c_.snapshot_lost; continue; }
+        ConversationCheckpoint& c = checks[found];
+        PoolEntry e;
+        const int64_t j = L / kChunk, cells = tail_cells(lanes, L - j * kChunk, page);
+        e.at = keys[(size_t) j];
+        e.cvec = cvec;
+        e.tail.assign(ids.begin() + j * kChunk, ids.begin() + L);
+        e.tokens = L;
+        e.tail_kv.resize(chunk_bytes(lanes, cells));
+        if (cells && !lanes_copy(lanes, g, j * kChunk, cells, regions(lanes, e.tail_kv.data(), cells), false, error))
+            return false;
+        // the compute it saves: the tokens past the deepest other point on its path (on disk or in the pool)
+        int64_t below = stored_on_path(keys, ids, L - 1);
+        if (const PoolEntry* p = pool_best(keys, ids, cvec, store_.stored_chunks(keys)); p && p->tokens < L)
+            below = std::max(below, p->tokens);
+        e.saved = L - below;
+        e.kept = c.branch || c.user_turn || c.pinned;
+        e.used = ++clock_;
+        e.since = Clock::now();
+        e.state = std::move(c);
+        e.state.ids.clear();
+        e.state.ids.shrink_to_fit();
+        for (auto it = pool_.begin(); it != pool_.end(); ++it)   // the same point again: the newer state
+            if (it->cvec == e.cvec && it->at == e.at && it->tail == e.tail) { pool_.erase(it); break; }
+        pool_.push_back(std::move(e));
+        moved.push_back(found);
+        ++c_.pool_adopted;
+    }
+    std::sort(moved.rbegin(), moved.rend());
+    for (size_t i : moved) checks.erase(checks.begin() + (std::ptrdiff_t) i);
+    pending_ = keep;
+    return trim(available, error);
+}
+
+bool ConversationTier::leave(const SessionState& ss, const ModelGeometry& g, const QsaState* draft, bool cvec,
+                             const std::vector<int32_t>& ids, std::vector<ConversationCheckpoint>& checks,
+                             ConversationCheckpoint&& live_state, std::optional<uint64_t> available,
+                             std::string& error) {
+    if (!on() || !opt_.pool || (int64_t) ids.size() < opt_.min_tokens) return adopt(ss, g, draft, cvec, ids, checks, 0, available, error);
+    if (!ensure_staging(error) || !device_idle(error)) return false;
+    const auto keys = kvstore::chain_keys(seed(cvec), ids.data(), ids.size());
+    if (!write_chunks(ss, g, draft, keys, ids, (int64_t) ids.size(), (int64_t) ids.size(), error)) return false;
+    const int64_t L = (int64_t) live_state.ids.size();
+    if (L == (int64_t) ids.size() && live_state.imgs.empty() && live_state.stage_parts.empty() &&
+        std::none_of(checks.begin(), checks.end(), [&](const ConversationCheckpoint& c) { return (int64_t) c.ids.size() == L; })) {
+        live_state.user_turn = true;   // the exact resume point: kept like the newest user message
+        checks.push_back(std::move(live_state));
+        if (std::find(pending_.begin(), pending_.end(), L) == pending_.end()) pending_.push_back(L);
+    }
+    return adopt(ss, g, draft, cvec, ids, checks, 0, available, error);
+}
+
+bool ConversationTier::trim(std::optional<uint64_t> available, std::string& error) {
+    if (!opt_.pool || pool_.empty()) return true;
+    uint64_t snap = 0;
+    for (const auto& e : pool_) snap = std::max<uint64_t>(snap, e.bytes());
+    const uint64_t cap = std::min<uint64_t>(std::max<uint64_t>(opt_.pool_max, opt_.pool_min * snap),
+                                            tier_pool_capacity(available, pool_bytes(), opt_.floor_bytes,
+                                                               opt_.pool_headroom, snap, opt_.pool_min));
+    while (!pool_.empty() && pool_bytes() > cap) {
+        // Marconi: recency and the compute saved, each normalised over the pool; the lowest leaves
+        uint64_t umin = UINT64_MAX, umax = 0;
+        int64_t smax = 1;
+        for (const auto& e : pool_) {
+            umin = std::min(umin, e.used); umax = std::max(umax, e.used); smax = std::max(smax, e.saved);
+        }
+        size_t victim = 0;
+        double low = 0;
+        for (size_t i = 0; i < pool_.size(); ++i) {
+            const auto& e = pool_[i];
+            const double rec = umax > umin ? double(e.used - umin) / double(umax - umin) : 1.0;
+            const double u = tier_utility(rec, double(std::max<int64_t>(e.saved, 0)) / double(smax), e.kept, opt_.alpha);
+            if (i == 0 || u < low) { low = u; victim = i; }
+        }
+        if (!pool_[victim].on_disk) {
+            if (!put_entry(pool_[victim], error)) return false;
+            ++c_.pool_spilled;
+        } else {
+            ++c_.pool_dropped;
+        }
+        pool_.erase(pool_.begin() + (std::ptrdiff_t) victim);
+    }
+    return store_.sync(error);
+}
+
+bool ConversationTier::save_pool(bool only_idle, std::string& error) {
+    const auto idle = std::chrono::seconds(std::max<int64_t>(opt_.idle_s, 0));
+    bool wrote = false;
+    for (auto& e : pool_) {
+        if (e.on_disk || (only_idle && Clock::now() - e.since < idle)) continue;
+        if (!put_entry(e, error)) return false;
+        e.on_disk = true;
+        wrote = true;
+    }
+    return !wrote || store_.sync(error);
 }
 
 ConversationTier::Hit ConversationTier::best(const std::vector<int32_t>& prompt, bool cvec) const {
@@ -248,6 +400,11 @@ ConversationTier::Hit ConversationTier::best(const std::vector<int32_t>& prompt,
     if (const kvstore::Record* r = store_.best_snapshot(keys, prompt.data(), prompt.size())) {
         h.tokens = r->tokens;
         h.cvec = cvec;
+    }
+    if (const PoolEntry* e = pool_best(keys, prompt, cvec, store_.stored_chunks(keys)); e && e->tokens >= h.tokens) {
+        h.tokens = e->tokens;   // the same point in RAM and on disk: RAM (no read of its state)
+        h.cvec = cvec;
+        h.pooled = true;
     }
     return h;
 }
@@ -259,9 +416,12 @@ bool ConversationTier::restore(const Hit& hit, const SessionState& ss, const Mod
     ++c_.restore_failures;   // undone at the end
     if (!ensure_staging(error) || !device_idle(error)) return false;
     const auto keys = kvstore::chain_keys(seed(hit.cvec), prompt.data(), prompt.size());
-    const kvstore::Record* snap = store_.best_snapshot(keys, prompt.data(), prompt.size());
-    if (!snap || snap->tokens != hit.tokens) return fail(error, "the snapshot is gone");
-    const int64_t tokens = snap->tokens, whole = tokens / kChunk;
+    const PoolEntry* entry = hit.pooled ? pool_best(keys, prompt, hit.cvec, store_.stored_chunks(keys)) : nullptr;
+    if (entry && entry->tokens != hit.tokens) entry = nullptr;
+    // not (or no longer) in the pool - the outgoing conversation's leave() may have spilled it since best(): disk
+    const kvstore::Record* snap = entry ? nullptr : store_.best_snapshot(keys, prompt.data(), prompt.size());
+    if (!entry && (!snap || snap->tokens != hit.tokens)) return fail(error, "the snapshot is gone");
+    const int64_t tokens = hit.tokens, whole = tokens / kChunk;
     std::vector<ConversationKvLane> lanes;
     if (!conversation_kv_lanes(ss, g, draft, lanes, error)) return false;
     const int64_t cells = tail_cells(lanes, tokens - whole * kChunk, page_of(lanes, g));
@@ -273,8 +433,15 @@ bool ConversationTier::restore(const Hit& hit, const SessionState& ss, const Mod
     out.tails.resize(layers * z.tail); out.dead.resize(layers * z.dead); out.block_pos.resize(layers * z.block_pos);
     const size_t state = out.gdn.size() + out.ple.size() + out.tails.size() + out.dead.size() + out.block_pos.size();
     // everything is checked before the first pool write: a snapshot of another layout is refused here
-    if (snap->payload != state + chunk_bytes(lanes, cells) || chunk_bytes(lanes, cells) > opt_.staging_bytes)
+    if (entry) {
+        const ConversationCheckpoint& s = entry->state;
+        if (s.gdn.size() != out.gdn.size() || s.ple.size() != out.ple.size() || s.tails.size() != out.tails.size() ||
+            s.dead.size() != out.dead.size() || s.block_pos.size() != out.block_pos.size() ||
+            entry->tail_kv.size() != chunk_bytes(lanes, cells))
+            return fail(error, "pooled snapshot does not fit this session");
+    } else if (snap->payload != state + chunk_bytes(lanes, cells) || chunk_bytes(lanes, cells) > opt_.staging_bytes) {
         return fail(error, "snapshot payload does not fit this session");
+    }
     const size_t per_chunk = chunk_bytes(lanes, kChunk);
     const int64_t batch = std::max<int64_t>(1, (int64_t) (opt_.staging_bytes / std::max<size_t>(per_chunk, 1)));
     for (int64_t j0 = 0; j0 < whole; j0 += batch) {
@@ -294,21 +461,38 @@ bool ConversationTier::restore(const Hit& hit, const SessionState& ss, const Mod
         }
         if (!lanes_copy(lanes, g, j0 * kChunk, m * kChunk, at, true, error)) return false;
     }
-    const auto at = regions(lanes, staging_, cells);
-    std::vector<kvstore::Store::Out> dst = {{out.gdn.data(), out.gdn.size()}, {out.ple.data(), out.ple.size()},
-                                            {out.tails.data(), out.tails.size()}, {out.dead.data(), out.dead.size()},
-                                            {out.block_pos.data(), out.block_pos.size()}};
-    for (size_t i = 0; i < lanes.size(); ++i) dst.push_back({at[i], lanes[i].bytes(cells)});
-    if (!store_.read(*snap, dst, error)) return false;
-    if (cells && !lanes_copy(lanes, g, whole * kChunk, cells, at, true, error)) return false;
+    bool was_on_disk = true, kept_branch = false;
+    if (entry) {
+        // the RAM pool's: its tail cells and its running state, no disk read; it is the session's again
+        if (cells && !lanes_copy(lanes, g, whole * kChunk, cells,
+                                 regions(lanes, const_cast<uint8_t*>(entry->tail_kv.data()), cells), true, error))
+            return false;
+        const size_t at_entry = (size_t) (entry - pool_.data());
+        out = std::move(pool_[at_entry].state);
+        was_on_disk = pool_[at_entry].on_disk;
+        kept_branch = out.branch;
+        pool_.erase(pool_.begin() + (std::ptrdiff_t) at_entry);
+        ++c_.pool_restores;
+    } else {
+        const auto at = regions(lanes, staging_, cells);
+        std::vector<kvstore::Store::Out> dst = {{out.gdn.data(), out.gdn.size()}, {out.ple.data(), out.ple.size()},
+                                                {out.tails.data(), out.tails.size()}, {out.dead.data(), out.dead.size()},
+                                                {out.block_pos.data(), out.block_pos.size()}};
+        for (size_t i = 0; i < lanes.size(); ++i) dst.push_back({at[i], lanes[i].bytes(cells)});
+        if (!store_.read(*snap, dst, error)) return false;
+        if (cells && !lanes_copy(lanes, g, whole * kChunk, cells, at, true, error)) return false;
+        kept_branch = (snap->flags & kvstore::kFlagBranch) != 0;
+    }
     std::vector<const QsaState*> states;
     for (const auto& l : lanes)
         if (std::find(states.begin(), states.end(), l.state) == states.end()) states.push_back(l.state);
     for (const QsaState* st : states)
         if (!conversation_kv_refresh(*st, g, tokens, error)) return false;
     out.ids.assign(prompt.begin(), prompt.begin() + tokens);
-    out.branch = (snap->flags & kvstore::kFlagBranch) != 0;
+    out.branch = kept_branch;
     if (!conversation_checkpoint_validate(out, ss, g, error)) return false;
+    // a pooled state that never reached disk waits again, now as the session's checkpoint
+    if (!was_on_disk && std::find(pending_.begin(), pending_.end(), tokens) == pending_.end()) pending_.push_back(tokens);
     --c_.restore_failures;
     ++c_.restores;
     c_.restored_tokens += (uint64_t) tokens;
@@ -318,14 +502,15 @@ bool ConversationTier::restore(const Hit& hit, const SessionState& ss, const Mod
 
 std::string ConversationTier::stats_line() const {
     const auto& s = store_.stats();
-    char b[1024];
+    char b[1536];
     std::snprintf(b, sizeof b,
                   "kv store: records=%llu chunks=%llu snapshots=%llu disk_bytes=%llu segments=%llu written_bytes=%llu "
                   "chunk_writes=%llu chunk_dedup=%llu snapshot_writes=%llu snapshot_now=%llu snapshot_deferred=%llu "
                   "snapshot_spilled=%llu snapshot_skipped=%llu snapshot_lost=%llu waiting=%zu restores=%llu "
                   "restored_tokens=%llu restore_failures=%llu restore_ms=%.1f persist_ms=%.1f rewrite_same=%llu "
                   "rewrite_differ=%llu draft_lookahead_miss=%llu read_errors=%llu gc_segments=%llu gc_copied=%llu "
-                  "gc_dropped=%llu torn=%llu",
+                  "gc_dropped=%llu torn=%llu pool_entries=%zu pool_bytes=%llu pool_adopted=%llu pool_restores=%llu "
+                  "pool_spilled=%llu pool_dropped=%llu",
                   (unsigned long long) s.records, (unsigned long long) s.chunks, (unsigned long long) s.snapshots,
                   (unsigned long long) s.disk_bytes, (unsigned long long) s.segments, (unsigned long long) s.written_bytes,
                   (unsigned long long) c_.chunk_writes, (unsigned long long) c_.chunk_dedup,
@@ -337,7 +522,9 @@ std::string ConversationTier::stats_line() const {
                   (unsigned long long) c_.rewrite_same, (unsigned long long) c_.rewrite_differ,
                   (unsigned long long) c_.draft_lookahead_miss, (unsigned long long) s.read_errors,
                   (unsigned long long) s.gc_segments, (unsigned long long) s.gc_copied, (unsigned long long) s.gc_dropped,
-                  (unsigned long long) s.torn);
+                  (unsigned long long) s.torn, pool_.size(), (unsigned long long) pool_bytes(),
+                  (unsigned long long) c_.pool_adopted, (unsigned long long) c_.pool_restores,
+                  (unsigned long long) c_.pool_spilled, (unsigned long long) c_.pool_dropped);
     return b;
 }
 

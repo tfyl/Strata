@@ -1430,6 +1430,18 @@ in one content-addressed store (no proxy, no whole-session files):
   record for the index. The session file commands (SAVE / RESTORE) still export and import single conversations.
 - *Metrics.* After each operation the engine logs `kv store: k=v ...`; the server's `/metrics` carries it under
   `conversation_cache.kv_store` and as `strata:kv_store_*`. `KVSTORE STATS` / `KVSTORE FLUSH` answer the same.
+- *One cache across the tiers (`v0.2.2-tfyl.5`).* A conversation the store keeps (`--kv-store-min-tokens` or more,
+  text only) no longer parks a K/V image in RAM when another conversation takes the session: its chunks are on
+  disk, and its running states - the live tip (taken at the switch: an agent that sends its reply back continues
+  from there), the newest user message, the waiting snapshots - move into a RAM pool with their tail cells. When it
+  comes back it resumes from the pool (the chunks from disk, ~0.4 s for 172K tokens; the state from RAM), so two
+  interleaved conversations switch with no snapshot written to disk. The pool holds at most `--kv-store-pool-mib`
+  (1536), less when MemAvailable minus `--conversation-cache-min-free-mib` and 512 MiB is less, at least two states;
+  under pressure the lowest Marconi utility leaves first - recency plus the prompt reading it saves over the next
+  point on its path, both normalised, a kept point (a branch point, the newest user message, the tip) one more - and
+  goes to disk when it is not there yet (spilled, never refused). States only RAM holds go to disk after
+  `--kv-store-idle-s` and at QUIT. `--kv-store-ram-park` parks the K/V image as well; `--kv-store-no-pool` is the
+  previous behaviour (park, and write the waiting snapshots at the switch).
 
 The request must be `Content-Type: application/json` (else `415`) and come from no browser page, Strata's own or a
 trusted origin (another site's `Origin` gets `403`, also with an API key); the Host and API-key checks apply as
