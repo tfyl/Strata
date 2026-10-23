@@ -71,9 +71,11 @@ int main() {
         std::vector<ConversationCheckpoint> chain;
         chain.push_back(checkpoint(10));
         chain.back().branch = true;
+        chain.back().user_turn = true;
         chain.back().stage_parts.push_back(checkpoint(10));
         auto split = conversation_checkpoints_split(std::move(chain), 1);
-        check(split.stage0.size() == 1 && split.stage0[0].branch && split.parts[0][0].branch, "split keeps the mark");
+        check(split.stage0.size() == 1 && split.stage0[0].branch && split.parts[0][0].branch &&
+              split.parts[0][0].user_turn, "split keeps the marks");
     }
     std::printf("session_resume_only_test OK (%d checks)\n", checks_run);
 }

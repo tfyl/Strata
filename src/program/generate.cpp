@@ -9726,11 +9726,12 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < is_tail.size(); ++i) tail_flags[i] = is_tail[i] != 0;
                 // the pin=N prefix is never the victim (flags only when one is pinned: nothing changes without)
                 std::unique_ptr<bool[]> pin_flags;
-                // (tfyl: and the branch point, kept the same way)
+                // (tfyl: and the branch point and the newest user message, kept the same way)
                 for (const ConvCheckpoint& k : checks)
-                    if (k.pinned || k.branch) {
+                    if (k.pinned || k.branch || k.user_turn) {
                         pin_flags.reset(new bool[checks.size()]);
-                        for (size_t i = 0; i < checks.size(); ++i) pin_flags[i] = checks[i].pinned || checks[i].branch;
+                        for (size_t i = 0; i < checks.size(); ++i)
+                            pin_flags[i] = checks[i].pinned || checks[i].branch || checks[i].user_turn;
                         break;
                     }
                 std::vector<int64_t> lens;
@@ -14050,6 +14051,8 @@ int main(int argc, char** argv) {
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return 1;
                 }
+                if (to == message_at && !message_tail)   // tfyl: the one kept user-message point is this one
+                    for (ConvCheckpoint& c : checks) c.user_turn = (int64_t) c.ids.size() == message_at;
                 if (to == branch_at) {   // tfyl: the one kept branch point is this one
                     for (ConvCheckpoint& c : checks) c.branch = (int64_t) c.ids.size() == branch_at;
                     std::fprintf(stderr, "strata serve: branch checkpoint at %lld tokens (the prompt leaves a cached "

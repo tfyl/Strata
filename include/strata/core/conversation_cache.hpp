@@ -32,6 +32,11 @@ struct ConversationCheckpoint {
     // tfyl: a branch point (message_boundary.hpp branch_checkpoint_at): where this prompt left a path the cache had
     // held.  Retention keeps it like a pin (one at a time); run-time only, like `pinned`.
     bool branch = false;
+    // tfyl: the start of the newest user message that is not a tool result.  An agent's side request (Hermes'
+    // background review: the history, then "Review the conversation above...", then up to 8 calls) forks there, and
+    // the main line's next request comes back to exactly this point.  Retention keeps it like a pin (one at a time)
+    // while the side request's calls add their own checkpoints; run-time only.
+    bool user_turn = false;
     // --prefill-pipe on a layer split: the plan a prompt segment [from, to) is read in - its chunk (0: none), the loan
     // its buffers were laid out for (which experts the prompt reads in place and which it streams: that sets bits
     // too), the pipe value it was planned with, whether it is one chunk and whether the plan changed the buffers'
@@ -113,6 +118,7 @@ inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<Co
         for (size_t k = 0; k < stages; ++k) {
             ConversationCheckpoint part;
             part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned; part.branch = c.branch;
+            part.user_turn = c.user_turn;
             out.parts[k].push_back(std::move(part));
         }
     }

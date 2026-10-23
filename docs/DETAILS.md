@@ -1153,7 +1153,9 @@ It still starts from a checkpoint it matches, and still saves the system-prompt 
   header and the periodic checkpoints sit past that point, so without this the main line read from token 0 (38-185K
   tokens in Hermes' traffic). A tool result (a user turn that starts with `<tool_response>`,
   `--tool-response-token`, default 248066) gets the rotating kind (one alive, the first to go): a tool loop makes one
-  per request. Any other message is an ordinary checkpoint, so it stays while the side request runs on.
+  per request. Any other message's checkpoint is kept like a `pin=N` prefix (the newest one only): Hermes'
+  background review forks the history with "Review the conversation above..." and makes up to 8 calls, and the
+  main line's next request comes back to exactly that message's start.
 - *Branch points* (`--branch-checkpoint-grain N`, default 256, 0 = off): when a prompt follows a path the engine
   holds - the live session's tokens or a parked conversation's - at least 2,048 tokens past where it can resume,
   it is read to where it leaves that path, rounded down to N tokens, and checkpointed there. Two chats whose system
