@@ -690,6 +690,19 @@ the end of the system prompt that every chat of a client shares, is kept for goo
 starts after it. A prompt of 2,048 tokens or more is also checkpointed at the end of its system prompt. Claude Code stamps its
 system prompt with a billing header that changes on every request; the server pins both stamps so the prompt stays the same.
 
+**Forks and branch points (tfyl fork).** Two more places are checkpointed, inside the same `--prompt-cache` count (no
+extra RAM):
+
+- *The newest message*, however long (`STRATA_CACHE_MESSAGE_BOUNDARY=1` upstream caps it at 1,024 tokens; here it is
+  on unless that variable is `0`). An agent that forks a side request off its history leaves its path 3 tokens into
+  the newest user message, past the turn header and the periodic checkpoints, so without this the main line read from
+  token 0 (38-185K tokens in Hermes' traffic). A tool result (`<tool_response>`, `--tool-response-token`, default
+  248066) gets the rotating kind: a tool loop makes one per request. Any other message is an ordinary checkpoint.
+- *Branch points* (`--branch-checkpoint-grain N`, default 256, `0` = off): a prompt that follows a held path (the live
+  session or a parked conversation) at least 2,048 tokens past where it can resume is read to where it leaves that
+  path, rounded down to N, and checkpointed there. The newest branch checkpoint is kept like a `pin=N` prefix. The
+  log says `branch checkpoint at N tokens`.
+
 | Option | Effect |
 | --- | --- |
 | `--prompt-cache N` | Number of checkpoints (`0` = off, which also disables parking). |
@@ -745,6 +758,16 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
 - `--session-save-reclaim` (engine argument, off by default) lets a save that fails its RAM check first release reconstructible
   host caches (retained K/V, oldest unpinned parked conversations, unpinned checkpoints), and the server waits up to 30 s for
   RAM accounting to catch up. It trades later prefix-cache hits for room to save and cannot guarantee a save.
+- A RESTORE that does not fit its RAM preflight (tfyl fork) first releases the retained K/V and then the oldest unpinned
+  parked conversations, one at a time, and is refused only if it still does not fit. It runs after the file's model and
+  configuration checks, so a file of another model evicts nothing; the live session and its checkpoints are untouched
+  until the restore replaces them. The log says `restore reclaimed N parked, B host bytes`. On by default;
+  `--no-session-restore-reclaim` or `STRATA_SESSION_RESTORE_RECLAIM=0` turns it off. The server does not retry a refused
+  RESTORE.
+- A SAVE (tfyl fork, `--session-resume-only N`, default 4096) writes one running state, the deepest checkpoint's, with the
+  K/V up to it, when the live tail past that checkpoint is at most N tokens: the tail is read again on the next turn anyway,
+  so the second ~118 MB state bought nothing on disk. Same file format; the RAM preflight is one checkpoint copy. A longer
+  tail, no checkpoint, or `-1` saves as upstream.
 - Clients still send their messages and images; the file holds engine state and token identity, not a chat export. A follow-up
   that continues the restored conversation reuses its state; a short tail may be read again. Only the deepest checkpoint is saved.
 - A file is bound to the model files (sampled by size and first and last MiB, not by path) and to the settings that change what

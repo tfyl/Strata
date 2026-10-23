@@ -1145,6 +1145,19 @@ uint64_t session_save_peak_bytes(const ConversationCheckpoint* deepest, const Se
     return n;
 }
 
+bool session_save_resume_only(const ConversationCheckpoint* deepest, uint64_t live_tokens, int64_t max_tail) {
+    if (!deepest || max_tail < 0 || deepest->ids.empty() || !deepest->stage_parts.empty() ||
+        deepest->ids.size() > live_tokens) return false;
+    return live_tokens - deepest->ids.size() <= (uint64_t) max_tail;
+}
+
+uint64_t session_save_resume_peak_bytes(const ConversationCheckpoint& deepest, const SessionSaveLive& live) {
+    uint64_t n = sat_add(kBlock, uint64_t(1) << 20);                          // write buffer, small vectors
+    n = sat_add(n, deepest.bytes());                                          // the image's copy of it
+    n = sat_add(n, sat_mul(live.kv_layers, sizeof(SessionKvSource) + 256));   // the K/V source directory
+    return n;
+}
+
 bool session_save_checkpoints(const std::vector<ConversationCheckpoint>& chain, const SessionSaveLive& live,
                               const std::function<bool(uint64_t need_bytes, std::string& why)>& admit,
                               std::vector<ConversationCheckpoint>& out, std::string& why) {
