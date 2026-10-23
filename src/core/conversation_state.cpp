@@ -348,6 +348,32 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     return true;
 }
 
+bool conversation_snapshot_sources_at(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                      const ConversationCheckpoint& resume, bool cvec, const SessionState& ss,
+                                      const ModelGeometry& g, const QsaState& draft, std::string& error) {
+    const std::vector<ConversationCheckpoint> none;
+    const ConversationView view{resume.ids, resume.imgs, none, cvec};
+    if (!resume.stage_parts.empty()) return fail(error, "a layer-split checkpoint cannot be a session file's state");
+    if (!view_validate(view, ss, g, error) || !conversation_checkpoint_validate(resume, ss, g, error) || !sync(error))
+        return false;
+    SavedConversation captured;
+    captured.geometry = geometry_key(g);
+    captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
+    captured.cvec = cvec;
+    captured.live.ids = resume.ids; captured.live.imgs = resume.imgs;
+    captured.live.gdn = resume.gdn; captured.live.ple = resume.ple; captured.live.tails = resume.tails;
+    captured.live.dead = resume.dead; captured.live.block_pos = resume.block_pos;
+    const int64_t upto = (int64_t) resume.ids.size();   // the pools' cells below it are the checkpoint's own
+    const size_t layers = owned_qsa(ss);
+    std::vector<SessionKvSource> out(layers + 1);
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_source(out[j], owned(ss, j), g, upto, true, error)) return false;
+    if (!conversation_kv_source(out.back(), draft, g, upto, false, error)) return false;
+    meta = std::move(captured);
+    sources = std::move(out);
+    return true;
+}
+
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error) {

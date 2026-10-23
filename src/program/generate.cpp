@@ -750,6 +750,15 @@ struct Options {
     /// --serve: the token that opens a chat turn (<|im_start|>).  The last one in a prompt is where the chat's
     /// history ends and the new assistant turn begins, which is the checkpoint the next request can reuse.
     int64_t turn_token = 248045;
+    /// --serve (tfyl): <tool_response>, the first text token of a tool result.  The checkpoint at the newest message is
+    /// the rotating "tail" kind for a tool result and a kept one for any other message (where side requests fork).
+    int64_t tool_response_token = 248066;
+    /// --serve (tfyl): branch-point checkpoints - where a prompt leaves a path the cache has held, rounded down to
+    /// this many tokens (0 = off; message_boundary.hpp branch_checkpoint_at)
+    int64_t branch_grain = 256;
+    /// --serve (tfyl): a session file keeps the deepest checkpoint as its live state (no second running state) when
+    /// the live tail past it is at most this many tokens; past that, the live state as well (-1 = always both)
+    int64_t session_resume_only = 4096;
     /// --serve (#458, opt-in): the role token of a short turn the server puts right before the new assistant turn
     /// (the "system" of a trailing reasoning-effort turn).  When the turn before the last <|im_start|> opens with it,
     /// the checkpoint goes in front of that turn instead, so it holds the conversation and not the effort text.
@@ -919,6 +928,15 @@ void usage() {
                  "                       near it, thinner further back) instead of the most recently used: a client that\n"
                  "                       rewrites its history N tokens back reads about N again, not the whole conversation\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
+                 "  --tool-response-token ID  --serve (tfyl): the first text token of a tool result (default 248066,\n"
+                 "                       <tool_response>): the newest message's checkpoint rotates for a tool result and\n"
+                 "                       is kept for any other message (STRATA_CACHE_MESSAGE_BOUNDARY=0 turns it off)\n"
+                 "  --branch-checkpoint-grain N  --serve (tfyl): also checkpoint where a prompt leaves a path the cache\n"
+                 "                       held (a fork, a system prompt that differs at a timestamp), rounded down to N\n"
+                 "                       tokens (default 256; 0 = off)\n"
+                 "  --session-resume-only N  --serve (tfyl): a session file holds one running state, the deepest\n"
+                 "                       checkpoint's, when the live tail past it is at most N tokens (default 4096;\n"
+                 "                       -1 = the live state and the checkpoint, as upstream)\n"
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
@@ -2655,6 +2673,9 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
+        else if (a == "--tool-response-token") o.tool_response_token = std::atoll(next("--tool-response-token"));
+        else if (a == "--branch-checkpoint-grain") o.branch_grain = std::max(0LL, std::atoll(next("--branch-checkpoint-grain")));
+        else if (a == "--session-resume-only") o.session_resume_only = std::max(-1LL, std::atoll(next("--session-resume-only")));
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
@@ -9705,10 +9726,11 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < is_tail.size(); ++i) tail_flags[i] = is_tail[i] != 0;
                 // the pin=N prefix is never the victim (flags only when one is pinned: nothing changes without)
                 std::unique_ptr<bool[]> pin_flags;
+                // (tfyl: and the branch point, kept the same way)
                 for (const ConvCheckpoint& k : checks)
-                    if (k.pinned) {
+                    if (k.pinned || k.branch) {
                         pin_flags.reset(new bool[checks.size()]);
-                        for (size_t i = 0; i < checks.size(); ++i) pin_flags[i] = checks[i].pinned;
+                        for (size_t i = 0; i < checks.size(); ++i) pin_flags[i] = checks[i].pinned || checks[i].branch;
                         break;
                     }
                 std::vector<int64_t> lens;
@@ -11972,7 +11994,7 @@ int main(int argc, char** argv) {
                 }
                 if (save) {
                     if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
-                    size_t bytes = 0, kept = 0;
+                    size_t bytes = 0, kept = 0, saved_tokens = live.size();
                     double capture_ms = 0;
                     try {
                         // RAM PREFLIGHT for the save (not a reservation), BEFORE anything is copied: the deepest
@@ -12022,20 +12044,36 @@ int main(int argc, char** argv) {
                         };
                         std::vector<ConvCheckpoint> disk_checks;
                         std::string why;
-                        if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why)) {
-                            refuse(why, strata::core::SessionError::memory);
-                            continue;
-                        }
-                        kept = disk_checks.size();
-                        const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
                         strata::core::SavedConversation meta;
                         std::vector<strata::core::SessionKvSource> sources;
-                        // the live running state comes off the device in one synchronous copy
-                        blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
-                                                                         err)) {
-                            refuse(err, strata::core::SessionError::io);
-                            continue;
+                        // tfyl (--session-resume-only): the deepest checkpoint as the file's one running state
+                        const ConvCheckpoint* resume_ck = strata::core::session_deepest_checkpoint(checks);
+                        if (strata::core::session_save_resume_only(resume_ck, live.size(), o.session_resume_only)) {
+                            if (!admit(strata::core::session_save_resume_peak_bytes(*resume_ck, sl), why)) {
+                                refuse(why, strata::core::SessionError::memory);
+                                continue;
+                            }
+                            kept = 1;
+                            saved_tokens = resume_ck->ids.size();
+                            if (!strata::core::conversation_snapshot_sources_at(meta, sources, *resume_ck, cvec_cached,
+                                                                                ss, g, mtp.kv_state(), err)) {
+                                refuse(err, strata::core::SessionError::io);
+                                continue;
+                            }
+                        } else {
+                            if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why)) {
+                                refuse(why, strata::core::SessionError::memory);
+                                continue;
+                            }
+                            kept = disk_checks.size();
+                            const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
+                            // the live running state comes off the device in one synchronous copy
+                            blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
+                            if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
+                                                                             err)) {
+                                refuse(err, strata::core::SessionError::io);
+                                continue;
+                            }
                         }
                         capture_ms = ms();
                         strata::core::SessionWriteOptions wo;
@@ -12054,10 +12092,11 @@ int main(int argc, char** argv) {
                         refuse("not enough RAM to save the session", strata::core::SessionError::memory);
                         continue;
                     }
-                    std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
-                                 "in %.1f ms (state %.1f ms)\n", live.size(), kept, checks.size(), bytes,
-                                 path.c_str(), ms(), capture_ms);
-                    std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
+                    std::fprintf(stderr, "strata serve: session saved %zu tokens%s, %zu of %zu checkpoints, %zu bytes to "
+                                 "%s in %.1f ms (state %.1f ms)\n", saved_tokens,
+                                 saved_tokens == live.size() ? "" : " (the resume checkpoint, not the live tail)", kept,
+                                 checks.size(), bytes, path.c_str(), ms(), capture_ms);
+                    std::printf("SAVED %zu %zu %.1f\n", saved_tokens, bytes, ms());
                 } else {
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
@@ -12544,6 +12583,18 @@ int main(int argc, char** argv) {
                                  k + 1, (long long) (k < now.size() ? now[k].start : -1));
                 }
             }
+            // tfyl: how far this prompt follows a path the cache holds (the live session's tokens, a parked
+            // conversation's), before anything is restored or parked: where it leaves that path is a branch point
+            int64_t known_shared = 0;
+            if (o.prompt_cache > 0 && o.branch_grain > 0 && req_imgs.empty() && !multi_gpu && want_cvec == cvec_cached &&
+                live_ok) {
+                const size_t m = std::min(live.size(), ids.size());
+                size_t i = 0;
+                while (i < m && (int64_t) live[i] == (int64_t) ids[i]) ++i;
+                known_shared = (int64_t) i;
+            }
+            if (o.prompt_cache > 0 && o.branch_grain > 0 && req_imgs.empty() && !multi_gpu)
+                known_shared = std::max(known_shared, conversations.longest_shared(ids, want_cvec));
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
@@ -13870,11 +13921,18 @@ int main(int argc, char** argv) {
                     }
             static const bool message_checkpoint = [] {
                 const char* e = std::getenv("STRATA_CACHE_MESSAGE_BOUNDARY");
-                return e != nullptr && std::atoi(e) != 0;
+                return e == nullptr || std::atoi(e) != 0;   // tfyl: on unless set to 0
             }();
-            // Only add a snapshot; the existing token and image checks still decide reuse.
+            // Only add a snapshot; the existing token and image checks still decide reuse.  tfyl: the newest message
+            // however long (no 1,024-token cap: a long user message is where a side request forks off), the rotating
+            // tail kind only for a tool result
             const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
-                ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token) : -1;
+                ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token, 8192, INT64_MAX) : -1;
+            const bool message_tail = message_at >= 0 &&
+                strata::program::message_is_tool_result(ids, message_at, o.tool_response_token);
+            // tfyl: the branch point, when this prompt leaves the known path well past where it resumes
+            const int64_t branch_at = req_ckpt && !multi_gpu && o.branch_grain > 0
+                ? strata::program::branch_checkpoint_at(known_shared, read_from, n, o.branch_grain) : -1;
             // pin=N (opt-in): one more place the prompt is read to and checkpointed.  One pinned prefix at a time: a
             // new pin replaces the old; it needs room for the root, the pin and a rotating checkpoint
             int64_t pin_at = -1;
@@ -13899,10 +13957,10 @@ int main(int argc, char** argv) {
                                  "%lld)\n", (long long) req_pin, (long long) read_from);
             }
             std::vector<int64_t> cuts = {reread_to, root_at, message_at, turn_at, n - 1};
-            if (pin_at >= 0) {
-                cuts.push_back(pin_at);
+            if (pin_at >= 0) cuts.push_back(pin_at);
+            if (branch_at >= 0) cuts.push_back(branch_at);
+            if (pin_at >= 0 || branch_at >= 0)
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
-            }
             int64_t at = read_from;
             // STRATA_ADMIT_MERGE_FIRST: the last part, when it goes through the windows, leaves its last tokens (up to
             // max_t with the last prompt token) to the first window, which starts at merge_at (-1: the first window
@@ -13912,7 +13970,8 @@ int main(int argc, char** argv) {
             int64_t merge_at = -1;
             auto merge_from = [&](int64_t a0, int64_t to) -> int64_t {
                 if (!admit_merge_first_env() || admit_slot < 0 || max_new != 1 || batch_mtp || pipe) return -1;
-                if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at) return -1;
+                if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at || to == branch_at)
+                    return -1;
                 if (!req_imgs.empty() || kvg.on || peer.valid() || remote_caches || remote_opt || fs_swap) return -1;
                 if (std::getenv("STRATA_LOGPOS") != nullptr) return -1;
                 if (host_res.empty() || !pending.empty() ||
@@ -13985,10 +14044,17 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
-                if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
-                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
+                if ((to == turn_at || to == root_at || to == message_at || to == pin_at || to == branch_at) &&
+                    !checkpoint_at(to, nullptr, to == message_at && message_tail && to != turn_at && to != root_at &&
+                                                    to != pin_at && to != branch_at)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return 1;
+                }
+                if (to == branch_at) {   // tfyl: the one kept branch point is this one
+                    for (ConvCheckpoint& c : checks) c.branch = (int64_t) c.ids.size() == branch_at;
+                    std::fprintf(stderr, "strata serve: branch checkpoint at %lld tokens (the prompt leaves a cached "
+                                         "path at %lld; it resumed from %lld)\n", (long long) branch_at,
+                                 (long long) known_shared, (long long) read_from);
                 }
                 if (to == pin_at && !pin_checkpoint(pin_at))
                     std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);

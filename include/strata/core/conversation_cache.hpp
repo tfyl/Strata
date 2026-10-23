@@ -29,6 +29,9 @@ struct ConversationCheckpoint {
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
+    // tfyl: a branch point (message_boundary.hpp branch_checkpoint_at): where this prompt left a path the cache had
+    // held.  Retention keeps it like a pin (one at a time); run-time only, like `pinned`.
+    bool branch = false;
     // --prefill-pipe on a layer split: the plan a prompt segment [from, to) is read in - its chunk (0: none), the loan
     // its buffers were laid out for (which experts the prompt reads in place and which it streams: that sets bits
     // too), the pipe value it was planned with, whether it is one chunk and whether the plan changed the buffers'
@@ -109,7 +112,7 @@ inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<Co
         if (c.stage_parts.size() != stages) continue;
         for (size_t k = 0; k < stages; ++k) {
             ConversationCheckpoint part;
-            part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned;
+            part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned; part.branch = c.branch;
             out.parts[k].push_back(std::move(part));
         }
     }
@@ -223,6 +226,21 @@ public:
         int64_t n = 0;
         for (const auto& e : entries_) n = std::max<int64_t>(n, (int64_t) e.live.ids.size());
         return n;
+    }
+    /// tfyl: the most tokens `prompt` shares with a parked conversation's history (with the same steering mode), so
+    /// the caller can tell where the prompt leaves a path the cache has held (message_boundary.hpp
+    /// branch_checkpoint_at).  Token ids only: pictures are the caller's to rule out.
+    template<class Token>
+    int64_t longest_shared(const std::vector<Token>& prompt, bool cvec) const {
+        int64_t best = 0;
+        for (const auto& e : entries_) {
+            if (e.cvec != cvec) continue;
+            const size_t m = std::min(prompt.size(), e.live.ids.size());
+            size_t i = 0;
+            while (i < m && (int64_t) prompt[i] == (int64_t) e.live.ids[i]) ++i;
+            best = std::max<int64_t>(best, (int64_t) i);
+        }
+        return best;
     }
 
     // Retain only the restored K/V buffers, not duplicate running checkpoints.

@@ -104,6 +104,12 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
+// tfyl (--session-resume-only): the same with a checkpoint of the live chain as the image's live state - its copied
+// running state, no other checkpoint, and the K/V streamed up to its length (the cells below a checkpoint of the live
+// chain are still its own).  Caller synchronizes and keeps the session untouched until the file is written.
+bool conversation_snapshot_sources_at(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                      const ConversationCheckpoint& resume, bool cvec, const SessionState& session,
+                                      const ModelGeometry& g, const QsaState& draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 enum class ConversationRestore { restored, invalid, transfer_failed };

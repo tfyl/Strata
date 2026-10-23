@@ -1144,6 +1144,23 @@ follows the reused prefix (or the root) is read in one run, and its session is n
 It still starts from a checkpoint it matches, and still saves the system-prompt root when that reaches
 `--prompt-cache-root`. Without the field (or with `true`) nothing changes.
 
+**Forks and branch points (tfyl fork, `v0.2.2-tfyl.2`).** Two more places are checkpointed, inside the same
+`--prompt-cache` count (no extra RAM):
+
+- *The newest message*, however long (upstream's opt-in `STRATA_CACHE_MESSAGE_BOUNDARY=1` capped it at 1,024
+  tokens; here it is on unless that variable is `0`). An agent that forks a side request off its history appends a
+  user message there, and its next main-line request leaves that side request's path 3 tokens into it; the turn
+  header and the periodic checkpoints sit past that point, so without this the main line read from token 0 (38-185K
+  tokens in Hermes' traffic). A tool result (a user turn that starts with `<tool_response>`,
+  `--tool-response-token`, default 248066) gets the rotating kind (one alive, the first to go): a tool loop makes one
+  per request. Any other message is an ordinary checkpoint, so it stays while the side request runs on.
+- *Branch points* (`--branch-checkpoint-grain N`, default 256, 0 = off): when a prompt follows a path the engine
+  holds - the live session's tokens or a parked conversation's - at least 2,048 tokens past where it can resume,
+  it is read to where it leaves that path, rounded down to N tokens, and checkpointed there. Two chats whose system
+  prompts differ only in a timestamp part there, past nothing reusable (the system prompt's root checkpoint is after
+  the timestamp); the third chat then resumes at the rounded point. The newest branch checkpoint is kept like a
+  `pin=N` prefix. The engine logs `branch checkpoint at N tokens`.
+
 **Checkpoints spread back from the end (opt-in, `--prompt-cache-spread`).** Least recent use keeps the newest points:
 every turn adds a checkpoint at its start, so after a few short turns the 6 sit within the last 1-2K tokens. An agent
 client that rewrites its history a few thousand tokens back (it trims an old tool output, drops a step) then matches
@@ -1373,6 +1390,13 @@ they do not count towards the room the read needs. Unknown RAM telemetry or an u
 engine logs `restore reclaimed N parked, B host bytes` when it evicts. It is on by default;
 `--no-session-restore-reclaim` (an engine argument in the config's `args`) or `STRATA_SESSION_RESTORE_RECLAIM=0`
 turns it off. Unlike a SAVE with `--session-save-reclaim`, the server does not wait or retry a refused RESTORE.
+
+A SAVE (tfyl fork, `--session-resume-only N`, default 4096) writes ONE running state: the deepest checkpoint's, as
+the file's live state, with the K/V up to it, when the live tail past that checkpoint is at most N tokens. That tail
+is the reply and what follows it, which the next turn renders again and reads again anyway, so the second ~118 MB
+state and the tail's K/V bought nothing on disk. The file is a session file like any other (same format, no
+checkpoints of its own); `n_saved` is the checkpoint's length, and its RAM preflight is one checkpoint copy instead of
+two plus the live state. A longer tail, no checkpoint, or `--session-resume-only -1` saves as upstream.
 
 The request must be `Content-Type: application/json` (else `415`) and come from no browser page, Strata's own or a
 trusted origin (another site's `Origin` gets `403`, also with an API key); the Host and API-key checks apply as

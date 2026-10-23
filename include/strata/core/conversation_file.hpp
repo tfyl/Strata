@@ -202,6 +202,15 @@ bool session_save_checkpoints(const std::vector<ConversationCheckpoint>& chain, 
                               const std::function<bool(uint64_t need_bytes, std::string& why)>& admit,
                               std::vector<ConversationCheckpoint>& out, std::string& why);
 
+// tfyl (--session-resume-only N): the file holds ONE running state, the deepest checkpoint's, as its live state, and
+// the K/V up to it - when there is one and the live tail past it is at most `max_tail` tokens (-1: never).  The tail
+// is what the next turn re-renders and reads again anyway (the reply, a rewritten last message), so the second
+// running state (~118 MB) and the tail's K/V buy nothing on disk.
+bool session_save_resume_only(const ConversationCheckpoint* deepest, uint64_t live_tokens, int64_t max_tail);
+// Its RAM preflight: the write buffer, the checkpoint's copy in the image and the K/V source directory (no live
+// running state is copied off the device).
+uint64_t session_save_resume_peak_bytes(const ConversationCheckpoint& deepest, const SessionSaveLive& live);
+
 // What a read checks before it allocates.  Every count is checked against the bytes left in the payload and against
 // these limits BEFORE its array is allocated; the defaults accept whatever the payload can hold.  The engine sets all
 // of them from its runtime (conversation_session_read_limits), and then the file size is bounded too.
