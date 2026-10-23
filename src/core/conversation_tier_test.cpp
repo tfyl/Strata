@@ -249,6 +249,98 @@ int main() {
     check(tier3.best(p3, false).tokens == 3999, "the spilled snapshot serves the next request");
     tier3.forget();
     check(tier3.stats_line().find("snapshot_spilled=1") != std::string::npos, "the stats line");
+
+    // ---- stage 3: the RAM snapshot pool, two interleaved conversations ----
+    {
+        const uint64_t snap = checkpoint(ss, g, ids, 10, 0).bytes();
+        check(tier_pool_capacity(std::nullopt, 0, 1, 1, snap, 2) == 2 * snap, "unknown RAM: the minimum");
+        check(tier_pool_capacity(uint64_t(10) * snap, 0, 4 * snap, snap, snap, 2) == 5 * snap, "what is above floor and headroom");
+        check(tier_pool_capacity(uint64_t(1) * snap, uint64_t(3) * snap, 4 * snap, snap, snap, 2) == 2 * snap,
+              "under pressure: shrinks to the minimum, never refuses");
+        check(tier_utility(0, 1, false) > tier_utility(1, 0, false) - 1e-9 && tier_utility(0, 0, true) > tier_utility(0.9, 0, false),
+              "Marconi: compute saved weighs like recency; a kept point outranks both");
+    }
+    const std::string dir2 = dir + "-pool";
+    ConversationTier::Options op = o;
+    op.dir = dir2; op.pool = true; op.min_gain = 64; op.pool_min = 1;
+    ConversationTier pool;
+    check(pool.open(op, {42, 43}, err), "a store with the pool");
+    std::vector<int32_t> A(3500);
+    for (size_t i = 0; i < A.size(); ++i) A[i] = 50000 + (int32_t) i;
+    std::vector<ConversationCheckpoint> checksA;
+    checksA.push_back(checkpoint(ss, g, A, 2000, 31)); checksA.back().user_turn = true;
+    checksA.push_back(checkpoint(ss, g, A, 3300, 32));
+    fill(21);
+    const bool a_ok = pool.after_request(ss, g, &draft, false, A, checksA, 0, plenty, err);
+    if (!a_ok) std::fprintf(stderr, "after_request: %s\n", err.c_str());
+    check(a_ok && pool.waiting(), "A's turn: chunks, two waiting");
+    const uint64_t chunks_a = pool.counters().chunk_writes;
+    check(chunks_a == 12, "A's whole chunks below its turn header");
+    const auto beforeA = pools_copy();
+    ConversationCheckpoint liveA = checkpoint(ss, g, A, 3500, 33);
+    check(pool.leave(ss, g, &draft, false, A, checksA, std::move(liveA), plenty, err), "the session leaves A");
+    check(pool.pool_entries() == 3 && checksA.empty() && !pool.waiting(), "its three points moved into the pool");
+    check(pool.counters().snapshot_writes == 0 && pool.counters().chunk_writes == 13, "no snapshot written; chunk 13 (to the tip)");
+    // B takes the session: its own K/V in the pools
+    std::vector<int32_t> B(3000);
+    for (size_t i = 0; i < B.size(); ++i) B[i] = 90000 + (int32_t) i;
+    wipe();
+    fill(77);
+    std::vector<ConversationCheckpoint> checksB = {checkpoint(ss, g, B, 2900, 41)};
+    check(pool.after_request(ss, g, &draft, false, B, checksB, 0, plenty, err), "B's turn");
+    // A comes back: the history and its next message
+    std::vector<int32_t> promptA(A);
+    for (int i = 0; i < 40; ++i) promptA.push_back(7000 + i);
+    const ConversationTier::Hit ha = pool.best(promptA, false);
+    check(ha.tokens == 3500 && ha.pooled, "A resumes at its tip, from RAM");
+    ConversationCheckpoint outA;
+    check(pool.adopt(ss, g, &draft, false, B, checksB, 0, plenty, err), "B leaves (its waiting point into the pool)");
+    check(pool.restore(ha, ss, g, &draft, promptA, outA, err), "A restored");
+    check(outA.ids.size() == 3500 && outA.user_turn && outA.gdn == checkpoint(ss, g, A, 3500, 33).gdn, "its tip state");
+    check(same_cells(beforeA, ss, g, &draft, 3500), "A's 3,500 cells, byte for byte");
+    check(pool.counters().pool_restores == 1 && pool.counters().snapshot_writes == 0,
+          "the whole switch away and back wrote no snapshot to disk");
+    check(pool.waiting(), "A's tip, never on disk, waits again as the session's checkpoint");
+    // RAM gets short: the pool spills the lowest utility to disk and keeps to its minimum (1 here)
+    const size_t before_trim = pool.pool_entries();
+    check(pool.trim(op.floor_bytes, err) && pool.pool_entries() == 1 && pool.counters().pool_spilled == before_trim - 1,
+          "shrinks under pressure by spilling, never refusing");
+    std::vector<int32_t> promptA2(A.begin(), A.begin() + 2500);
+    promptA2.push_back(1);
+    check(pool.best(promptA2, false).tokens == 2000, "a spilled point still serves (from disk or RAM)");
+    check(pool.save_pool(false, err) && pool.stats_line().find("pool_entries=1") != std::string::npos, "QUIT saves the pool");
+    ConversationTier reopened;
+    check(reopened.open(op, {42, 43}, err) && reopened.best(promptA2, false).tokens == 2000, "and it is on disk after a restart");
+    // a pooled hit whose entry the outgoing conversation's leave() spills before the restore: it comes from disk
+    {
+        ConversationTier::Options o3 = op;
+        o3.dir = dir2 + "-3"; o3.pool_min = 0;
+        ConversationTier t;
+        check(t.open(o3, {42, 43}, err), "a fourth store");
+        std::vector<int32_t> C(2000);
+        for (size_t i = 0; i < C.size(); ++i) C[i] = 120000 + (int32_t) i;
+        std::vector<ConversationCheckpoint> checksC = {checkpoint(ss, g, C, 1500, 51)};
+        checksC.back().user_turn = true;
+        fill(55);
+        check(t.after_request(ss, g, &draft, false, C, checksC, 0, plenty, err), "C's turn");
+        const auto beforeC = pools_copy();
+        check(t.leave(ss, g, &draft, false, C, checksC, checkpoint(ss, g, C, 2000, 52), plenty, err) &&
+              t.pool_entries() == 2, "C leaves: two points in RAM");
+        std::vector<int32_t> promptC(C);
+        promptC.push_back(3);
+        const ConversationTier::Hit hc = t.best(promptC, false);
+        check(hc.tokens == 2000 && hc.pooled, "a pooled hit");
+        check(t.trim(o3.floor_bytes, err) && t.pool_entries() == 0 && t.counters().pool_spilled == 2, "then all spilled");
+        wipe();
+        ConversationCheckpoint outC;
+        check(t.restore(hc, ss, g, &draft, promptC, outC, err) && outC.ids.size() == 2000 &&
+              outC.gdn == checkpoint(ss, g, C, 2000, 52).gdn, "restored from disk instead");
+        check(same_cells(beforeC, ss, g, &draft, 2000), "byte for byte");
+        std::string rm3 = "rm -rf '" + o3.dir + "'";
+        (void) !std::system(rm3.c_str());
+    }
+    std::string rm2 = "rm -rf '" + dir2 + "'";
+    (void) !std::system(rm2.c_str());
     (void) before;
     std::string rm = "rm -rf '" + dir.substr(0, dir.rfind('/')) + "'";
     (void) !std::system(rm.c_str());
