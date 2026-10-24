@@ -57,6 +57,9 @@ struct Piece {
 };
 /// A payload's digest, as the store records it (Record::sum).
 uint64_t digest(const std::vector<Piece>& payload);
+/// The lineage after one more chunk (its payload digest); the lineage of no chunk is kLineageSeed.
+inline constexpr uint64_t kLineageSeed = 0x6c696e6561676531ull;
+uint64_t chain_lineage(uint64_t prev, uint64_t chunk_sum);
 
 enum class Kind : uint32_t { chunk = 1, snapshot = 2 };
 
@@ -73,6 +76,11 @@ struct Record {
     int64_t tokens = 0;          // snapshot: its token count
     uint32_t flags = 0;          // snapshot: kFlagBranch, ...
     std::vector<int32_t> tail;   // snapshot: the tokens past its whole chunks
+    // snapshot (tfyl.6): the lineage of the chunks below it when it was taken - a chained digest of their payload
+    // digests (chain_lineage).  A restore takes it only with chunks of the same lineage: a chunk read again with
+    // other bytes replaces the stored one, and the snapshots taken over the old bytes stop matching.  0: unknown
+    // (a record of tfyl.4/.5), never taken.
+    uint64_t lineage = 0;
     size_t bytes_on_disk() const { return kPage + (payload + kPage - 1) / kPage * kPage; }
 };
 inline constexpr uint32_t kFlagBranch = 1;
@@ -109,16 +117,19 @@ public:
     /// chunks must all be stored, its tail must be the prompt's next tokens and it must end before the prompt's
     /// last token (which starts the next verify window).  nullptr: none.
     const Record* best_snapshot(const std::vector<Key>& keys, const int32_t* prompt, size_t n) const;
+    /// Every snapshot on that path, deepest first (the caller checks each one's lineage).
+    std::vector<const Record*> snapshots_on_path(const std::vector<Key>& keys, const int32_t* prompt, size_t n) const;
     /// How many leading chunks of `keys` are stored (keys[1..j] all present).
     size_t stored_chunks(const std::vector<Key>& keys) const;
 
-    /// A chunk, first writer wins: an existing key is left as it is (true, `*written` false).
+    /// A chunk.  An existing key is left as it is (true, `*written` false), unless `replace`: then the new bytes
+    /// are written and the index points at them (the newest writer).
     bool put_chunk(const Key& k, const Key& parent, int32_t next_token, const std::vector<Piece>& payload,
-                   std::string& error, bool* written = nullptr);
-    /// A snapshot of `tokens` tokens hanging off `at` with `tail` past the whole chunks.  One at the same place
-    /// (key, tail) is replaced.
+                   std::string& error, bool* written = nullptr, bool replace = false);
+    /// A snapshot of `tokens` tokens hanging off `at` with `tail` past the whole chunks, over chunks of `lineage`.
+    /// One at the same place (key, tail) is replaced.
     bool put_snapshot(const Key& at, int64_t tokens, const std::vector<int32_t>& tail, uint32_t flags,
-                      const std::vector<Piece>& payload, std::string& error);
+                      const std::vector<Piece>& payload, std::string& error, uint64_t lineage = 0);
     /// Reads a record's payload into `dst` (`n` = its payload bytes) and checks its digest; marks it used.
     bool read(const Record& r, void* dst, size_t n, std::string& error);
     /// The same, scattered into pieces whose sizes add up to the payload.
