@@ -438,6 +438,71 @@ int main() {
         std::string rm6 = "rm -rf '" + ov.dir + "'";
         (void) !std::system(rm6.c_str());
     }
+    // ---- tfyl.7: what reaches disk ----
+    // the frontier: a conversation's three pooled states (the newest user message, a turn header, the tip); spilled,
+    // the turn header (under the tip) stays in RAM only, the fork point and the tip go to disk
+    {
+        ConversationTier::Options of = op;
+        of.dir = dir2 + "-frontier"; of.min_gain = 64; of.pool_min = 0;
+        ConversationTier t;
+        check(t.open(of, {42, 43}, err), "a frontier store");
+        std::vector<int32_t> F(3000);
+        for (size_t i = 0; i < F.size(); ++i) F[i] = 500000 + (int32_t) i;
+        fill(101);
+        std::vector<ConversationCheckpoint> cf = {checkpoint(ss, g, F, 1200, 111), checkpoint(ss, g, F, 2400, 112)};
+        cf[0].user_turn = true;
+        check(t.after_request(ss, g, &draft, false, F, cf, 0, plenty, err) &&
+              t.leave(ss, g, &draft, false, F, cf, checkpoint(ss, g, F, 3000, 113), 0, plenty, err) &&
+              t.pool_entries() == 3, "three states in the pool");
+        check(t.trim(of.floor_bytes, err) && t.pool_entries() == 0, "all leave the pool");
+        check(t.counters().snapshot_writes == 2 && t.counters().snapshot_superseded == 1 &&
+              t.counters().pool_spilled == 2 && t.counters().pool_dropped == 1,
+              "the fork point and the tip are written; the turn header under the tip is not");
+        std::vector<int32_t> f1(F);
+        f1.push_back(1);
+        check(t.best(f1, false).tokens == 3000, "the conversation comes back at its tip");
+        std::vector<int32_t> f2(F.begin(), F.begin() + 1500);
+        f2.push_back(2);
+        check(t.best(f2, false).tokens == 1200, "and a fork comes back at the user message");
+        check(t.stats_line().find("written_snapshot_bytes=") != std::string::npos &&
+              t.store_stats().written_snapshot_bytes > 0 && t.store_stats().written_chunk_bytes > 0, "bytes by kind");
+        std::string rm7 = "rm -rf '" + of.dir + "'";
+        (void) !std::system(rm7.c_str());
+    }
+    // the budget: spent, a short new conversation is not stored, a long one is, only fork points reach disk
+    {
+        ConversationTier::Options ob = op;
+        ob.dir = dir2 + "-budget"; ob.min_gain = 64; ob.pool_min = 0; ob.min_tokens = 1000;
+        ob.budget_bytes_day = 20ull << 20;   // 20 MiB a day: one conversation spends it
+        ConversationTier t;
+        check(t.open(ob, {42, 43}, err), "a budget store");
+        std::vector<int32_t> G(3000);
+        for (size_t i = 0; i < G.size(); ++i) G[i] = 600000 + (int32_t) i;
+        fill(121);
+        std::vector<ConversationCheckpoint> cg = {checkpoint(ss, g, G, 2800, 131)};
+        check(t.after_request(ss, g, &draft, false, G, cg, 0, plenty, err) && t.counters().chunk_writes == 10,
+              "under the budget: stored as usual");
+        check(t.stats_line().find("spent_24h=0") == std::string::npos && t.admit_min_tokens() > 1000,
+              "spent: the threshold rises");
+        std::vector<int32_t> H(1500);
+        for (size_t i = 0; i < H.size(); ++i) H[i] = 700000 + (int32_t) i;
+        std::vector<ConversationCheckpoint> ch = {checkpoint(ss, g, H, 1400, 132)};
+        const uint64_t w = t.counters().chunk_writes;
+        check(t.after_request(ss, g, &draft, false, H, ch, 0, plenty, err) && t.counters().chunk_writes == w &&
+              t.counters().budget_skipped == 1, "a short new conversation is not stored");
+        // the long one keeps growing on disk (mostly stored already)
+        std::vector<int32_t> G2(G);
+        for (int i = 0; i < 600; ++i) G2.push_back(800000 + i);
+        std::vector<ConversationCheckpoint> cg2 = {checkpoint(ss, g, G2, 3500, 133)};
+        check(t.after_request(ss, g, &draft, false, G2, cg2, 2800, plenty, err) && t.counters().chunk_writes > w,
+              "a mostly stored conversation goes on");
+        // its states leave: over the budget only the fork point would reach disk; the plain one stays in RAM only
+        check(t.leave(ss, g, &draft, false, G2, cg2, ConversationCheckpoint{}, 0, plenty, err) &&
+              t.trim(ob.floor_bytes, err) && t.counters().snapshot_budget_dropped >= 1 && t.counters().snapshot_writes == 0,
+              "over the budget a plain state is not written");
+        std::string rm8 = "rm -rf '" + ob.dir + "'";
+        (void) !std::system(rm8.c_str());
+    }
     std::string rm2 = "rm -rf '" + dir2 + "'";
     (void) !std::system(rm2.c_str());
     (void) before;
