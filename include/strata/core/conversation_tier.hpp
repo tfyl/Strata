@@ -81,6 +81,11 @@ public:
         uint64_t pool_min = 2;                   // snapshots it keeps whatever RAM says
         uint64_t pool_max = 1536ull << 20;       // and at most this, whatever RAM says (--kv-store-pool-mib)
         double alpha = 1.0;                      // Marconi's weight of the compute saved against recency
+        // tfyl.7: what the store may write in a rolling 24 h (chunks, snapshots and GC copies; 0 = no limit).
+        // Over it, a conversation is stored only past a raised threshold (min_tokens doubled per quarter of the
+        // budget over) unless it is mostly stored already, and only fork points (a branch, the newest user message)
+        // still go to disk as snapshots
+        uint64_t budget_bytes_day = 0;
     };
     /// What best() found (restore() looks it up again: a store write in between may move the record).
     struct Hit {
@@ -94,6 +99,9 @@ public:
         uint64_t restores = 0, restored_tokens = 0, restore_failures = 0, draft_lookahead_miss = 0;
         uint64_t rewrite_same = 0, rewrite_differ = 0, lineage_skipped = 0, tip_taken = 0, tip_skipped = 0;
         uint64_t pool_adopted = 0, pool_restores = 0, pool_spilled = 0, pool_dropped = 0;
+        // tfyl.7: states not written because a deeper state of the same conversation is in RAM or on disk, or the
+        // budget was spent; requests whose conversation was not stored because of the budget's raised threshold
+        uint64_t snapshot_superseded = 0, snapshot_budget_dropped = 0, budget_skipped = 0;
         double restore_ms = 0, persist_ms = 0;
     };
 
@@ -170,6 +178,11 @@ public:
                  const std::vector<int32_t>& prompt, ConversationCheckpoint& out, std::string& error);
 
     const Counters& counters() const { return c_; }
+    /// tfyl.7: the store's writes in the rolling 24 h, whether that is over the budget, and the conversation length a
+    /// new conversation needs to be stored now (min_tokens, raised over the budget).
+    uint64_t spent_24h() const;
+    bool over_budget() const;
+    int64_t admit_min_tokens() const;
     const kvstore::Stats& store_stats() const { return store_.stats(); }
     /// One line for the log and the server's /metrics ("kv store: k=v ...").
     std::string stats_line() const;
@@ -189,11 +202,22 @@ private:
         int64_t tokens = 0, saved = 0;      // its length; the tokens it saves over the next point on its path
         uint64_t used = 0;
         bool kept = false, on_disk = false;
+        bool tip = false;                   // the conversation's live tip when it left (not a fork point)
+        uint64_t group = 0;                 // the adopt it came in with: one conversation's states share it
         uint64_t lineage = 0;               // the chunks below it when it was taken (kvstore Record::lineage)
         std::chrono::steady_clock::time_point since{};
         size_t bytes() const { return state.bytes() + tail_kv.capacity() + tail.capacity() * 4; }
     };
     bool put_entry(const PoolEntry& e, std::string& error);
+    /// tfyl.7: whether a state should reach disk at all: not when a deeper state of its own conversation is in the
+    /// pool or was written (a fork point - a branch, the newest user message - is exempt: the main line comes back to
+    /// it), and over the budget only a fork point that saves 2 x min_gain.  Counts what it drops.
+    bool disk_worthy(const PoolEntry& e, bool budget = true);
+    /// Whether a key `depth_a` chunks deep is on the path of another `depth_b` deep (its parents walked back).
+    bool on_path(const kvstore::Key& a, size_t depth_a, const kvstore::Key& b, size_t depth_b) const;
+
+    /// Whether this conversation is stored: past admit_min_tokens(), or mostly stored already.
+    bool admitted(const std::vector<kvstore::Key>& keys, const std::vector<int32_t>& ids) const;
     const PoolEntry* pool_best(const std::vector<kvstore::Key>& keys, const std::vector<int32_t>& prompt, bool cvec,
                                const std::vector<uint64_t>& lin) const;
     int64_t stored_on_path(const std::vector<kvstore::Key>& keys, const std::vector<int32_t>& ids, int64_t tokens) const;
@@ -211,7 +235,10 @@ private:
     uint8_t* staging_ = nullptr;
     std::vector<int64_t> pending_;   // checkpoint lengths waiting in RAM
     std::vector<PoolEntry> pool_;    // stage 3: states of conversations that left the session
-    uint64_t clock_ = 0;
+    uint64_t clock_ = 0, group_ = 0;
+    mutable std::vector<std::pair<std::chrono::steady_clock::time_point, uint64_t>> spend_;   // (when, bytes)
+    mutable uint64_t spend_seen_ = 0;                                                          // written_bytes accounted
+    std::vector<std::pair<uint64_t, int64_t>> group_disk_;                             // group -> deepest written
     std::chrono::steady_clock::time_point last_request_{};
     mutable Counters c_;   // (lineage_skipped counts in the const lookups)
 };

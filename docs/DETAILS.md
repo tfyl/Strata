@@ -1456,6 +1456,20 @@ in one content-addressed store (no proxy, no whole-session files):
   (stored, waiting or pooled); a prompt that only re-renders the last turn leaves a tip a few hundred tokens past the
   turn header, which the gate drops (`tip_taken` / `tip_skipped`). A request of the same conversation keeps the
   checkpoint it resumes from in the chain.
+- *What reaches disk (`v0.2.2-tfyl.7`).* On a day of ~45 new 10-30K-token conversations an hour, `tfyl.5` wrote
+  ~257 GB in ~21 h. The causes, and what changed:
+  - Most snapshot writes (957 of 1,149) were pool spills, of states nobody resumed from disk (163 disk restores).
+    A state now reaches disk only when no deeper state of its own conversation is in the pool or on disk (the
+    frontier). Fork points (a branch, the newest user message) are exempt: the main line comes back to them
+    (`snapshot_superseded`). The idle flush and QUIT write the same frontier.
+  - The collection took the oldest segment and copied forward everything used since it was written. Every request
+    touches its conversation's chunks, so that meant copying ~28 GB. It now takes the segment with the least live data
+    among the oldest 16, and copies forward only what was used in the last 24 h.
+  - `--kv-store-gib-day N` (0 = off) is a rolling write budget. Over it, a new conversation is stored only once it
+    reaches `--kv-store-min-tokens` doubled per quarter of the budget it is over. One mostly stored already goes on.
+    Only fork points that save twice `--kv-store-min-gain` reach disk as snapshots (`spent_24h`, `admit_min_tokens`,
+    `budget_skipped`, `snapshot_budget_dropped`).
+  - `written_bytes` is split into `written_chunk_bytes`, `written_snapshot_bytes` and `written_gc_bytes`.
 
 The request must be `Content-Type: application/json` (else `415`) and come from no browser page, Strata's own or a
 trusted origin (another site's `Origin` gets `403`, also with an API key); the Host and API-key checks apply as

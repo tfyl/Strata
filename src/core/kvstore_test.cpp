@@ -172,6 +172,35 @@ int main() {
               t.stats().chunks == s.stats().chunks, "the same records after a reopen");
         rmrf(d2);
     }
+    // tfyl.7: the collection picks the segment with the least live data among the oldest, and copies forward only
+    // what was used within copy_window_s; written bytes are counted by kind.
+    {
+        const std::string d4 = tmpdir();
+        Store s;
+        std::string err;
+        Store::Options so{d4, (5u << 20) / 2, 1u << 20, true};   // 2.5 MiB: the 13th record crosses it
+        so.copy_window_s = 0;   // nothing counts as recent: nothing is copied forward
+        check(s.open(so, err), "a store for the collection order");
+        const auto big = bytes(200000, 7);
+        std::vector<Key> seg1, seg2;
+        auto put = [&](int i, std::vector<Key>& into, bool replace = false, const Key* k0 = nullptr) {
+            int32_t t[256];
+            for (int k = 0; k < 256; ++k) t[k] = 777000 + i * 1000 + k;
+            const Key k = k0 ? *k0 : chain_next(seed, t, 256);
+            bool w = false;
+            check(s.put_chunk(k, seed, 0, {{big.data(), big.size()}}, err, &w, replace) && w, "put");
+            if (!k0) into.push_back(k);
+        };
+        for (int i = 0; i < 5; ++i) put(i, seg1);        // segment 1: five live chunks
+        for (int i = 5; i < 10; ++i) put(i, seg2);       // segment 2: five chunks...
+        for (const Key& k : seg2) put(0, seg2, true, &k);   // ...all replaced (segment 3): segment 2 is dead
+        check(s.stats().gc_segments >= 1 && s.chunk(seg1[0]) && s.chunk(seg2[0]),
+              "the dead segment 2 went first, not the older segment 1 with live data");
+        check(s.stats().gc_copied == 0, "copy_window_s 0: nothing copied forward");
+        check(s.stats().written_chunk_bytes == s.stats().written_bytes && s.stats().written_gc_bytes == 0 &&
+              s.stats().written_snapshot_bytes == 0, "written bytes by kind");
+        rmrf(d4);
+    }
     // Buffered I/O (no O_DIRECT) works the same.
     {
         const std::string d3 = tmpdir();

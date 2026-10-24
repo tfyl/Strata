@@ -71,6 +71,7 @@ struct Record {
     uint64_t sum = 0;            // payload digest
     uint64_t seq = 0;            // write order, store-wide
     uint64_t used = 0;           // the store's clock when last read or matched (0: never since written)
+    uint64_t used_s = 0;         // tfyl.7: the wall-clock second of that use (not on disk: 0 after a reopen)
     Key key, parent;             // chunk: its key and the one below; snapshot: the key of the chunks below it
     int32_t next_token = -1;     // chunk: the token after it (the draft layer's last cell depends on it)
     int64_t tokens = 0;          // snapshot: its token count
@@ -88,6 +89,8 @@ inline constexpr uint32_t kFlagBranch = 1;
 struct Stats {
     uint64_t records = 0, chunks = 0, snapshots = 0, disk_bytes = 0, segments = 0;
     uint64_t written_bytes = 0, chunks_written = 0, snapshots_written = 0;   // since open
+    // tfyl.7: written_bytes by what wrote them
+    uint64_t written_chunk_bytes = 0, written_snapshot_bytes = 0, written_gc_bytes = 0;
     uint64_t gc_segments = 0, gc_dropped = 0, gc_copied = 0, read_errors = 0, torn = 0;
 };
 
@@ -98,6 +101,10 @@ public:
         uint64_t max_bytes = 100ull << 30;     // the budget: over it, the oldest segment goes
         uint64_t segment_bytes = 256ull << 20;
         bool direct = true;                    // O_DIRECT when the filesystem takes it
+        // tfyl.7: over the budget, the segment with the least live data among the oldest `gc_window` goes (the
+        // oldest on a tie); a record in it is copied forward only when it was used in the last `copy_window_s`
+        size_t gc_window = 16;
+        uint64_t copy_window_s = 86400;
     };
     Store();
     ~Store();

@@ -770,6 +770,9 @@ struct Options {
     /// K/V image; --kv-store-ram-park parks the image as well, --kv-store-no-pool goes back to stage 2
     bool kv_store_pool = true, kv_store_ram_park = false;
     int64_t kv_store_pool_mib = 1536;
+    /// --serve (tfyl.7): what the disk tier may write in a rolling 24 h, GiB (0 = no limit): over it a new
+    /// conversation is stored only past a raised threshold and only fork points reach disk as snapshots
+    int64_t kv_store_gib_day = 0;
     /// --serve (#458, opt-in): the role token of a short turn the server puts right before the new assistant turn
     /// (the "system" of a trailing reasoning-effort turn).  When the turn before the last <|im_start|> opens with it,
     /// the checkpoint goes in front of that turn instead, so it holds the conversation and not the effort text.
@@ -963,6 +966,9 @@ void usage() {
                  "                       spills to disk, keeping 2), instead of a parked K/V image\n"
                  "  --kv-store-no-pool   no pool: park as before and write those states to disk at the switch\n"
                  "  --kv-store-ram-park  the pool and the parked K/V image both\n"
+                 "  --kv-store-gib-day N  the disk tier writes at most about N GiB in a rolling 24 h (default 0 = no\n"
+                 "                       limit): over it, new conversations are stored only past a raised length\n"
+                 "                       and only fork points reach disk as snapshots\n"
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
@@ -2710,6 +2716,7 @@ int main(int argc, char** argv) {
         else if (a == "--kv-store-no-pool") o.kv_store_pool = false;
         else if (a == "--kv-store-ram-park") o.kv_store_ram_park = true;
         else if (a == "--kv-store-pool-mib") o.kv_store_pool_mib = std::max(0LL, std::atoll(next("--kv-store-pool-mib")));
+        else if (a == "--kv-store-gib-day") o.kv_store_gib_day = std::max(0LL, std::atoll(next("--kv-store-gib-day")));
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
@@ -11909,6 +11916,7 @@ int main(int argc, char** argv) {
                 to.floor_bytes = (uint64_t) o.conversation_cache_min_free_mib << 20;
                 to.pool = o.kv_store_pool;
                 to.pool_max = (uint64_t) o.kv_store_pool_mib << 20;
+                to.budget_bytes_day = (uint64_t) o.kv_store_gib_day << 30;
                 if (!kv_tier.open(to, identity, e)) std::fprintf(stderr, "strata serve: --kv-store is off: %s\n", e.c_str());
                 else tier_log("kv store open");
             }
