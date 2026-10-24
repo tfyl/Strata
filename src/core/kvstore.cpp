@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <map>
 
 #if defined(_WIN32)
@@ -351,19 +352,35 @@ bool Store::append(Record& r, const std::vector<Piece>& payload, std::string& er
 
 bool Store::keep_budget(std::string& error) {
     while (st_.disk_bytes > opt_.max_bytes && ix_->segs.size() > 1) {
-        const uint32_t old = ix_->segs.begin()->first;
-        if (old == seg_) break;
-        // the records still indexed in it: the ones used since they were written get one more segment's life
+        // tfyl.7: the segment with the least live data among the oldest gc_window (not the active one): a segment
+        // whose chunks were replaced or whose snapshots were superseded goes before one full of live data
+        std::map<uint32_t, uint64_t> live_bytes;
+        for (const auto& c : ix_->chunks) live_bytes[c.second.seg] += c.second.bytes_on_disk();
+        for (const auto& v : ix_->snaps) for (const auto& sn : v.second) live_bytes[sn.seg] += sn.bytes_on_disk();
+        uint32_t old = 0;
+        double low = 2.0;
+        size_t seen = 0;
+        for (const auto& sg : ix_->segs) {
+            if (sg.first == seg_) continue;
+            if (seen++ >= std::max<size_t>(opt_.gc_window, 1)) break;
+            const double ratio = sg.second ? double(live_bytes[sg.first]) / double(sg.second) : 0.0;
+            if (ratio < low - 1e-9) { low = ratio; old = sg.first; }
+        }
+        if (seen == 0) break;
+        const uint64_t now = (uint64_t) ::time(nullptr);
+        // the records still indexed in it: the ones used lately get one more segment's life
         std::vector<Record> live;
         for (const auto& c : ix_->chunks) if (c.second.seg == old) live.push_back(c.second);
-        for (const auto& v : ix_->snaps) for (const auto& s : v.second) if (s.seg == old) live.push_back(s);
+        for (const auto& v : ix_->snaps) for (const auto& sn : v.second) if (sn.seg == old) live.push_back(sn);
         const int fd = ::open(seg_path(old).c_str(), O_RDONLY | O_CLOEXEC);
         for (const Record& r : live) {
             index_drop(r);
-            if (r.used == 0 || fd < 0) { ++st_.gc_dropped; continue; }
+            const bool recent = r.used != 0 && r.used_s != 0 && now - std::min(now, r.used_s) <= opt_.copy_window_s;
+            if (!recent || fd < 0) { ++st_.gc_dropped; continue; }
             // copy forward in pieces of the I/O buffer: the payload, then its header (same digest, a new place)
             Record c = r;
             c.used = 0;
+            c.used_s = 0;
             c.seq = seq_++;
             if (end_ > 0 && end_ + c.bytes_on_disk() > opt_.segment_bytes && !roll(error)) { ::close(fd); return false; }
             c.seg = seg_; c.off = end_;
@@ -380,12 +397,13 @@ bool Store::keep_budget(std::string& error) {
             ix_->segs[seg_] = end_;
             st_.disk_bytes += c.bytes_on_disk();
             st_.written_bytes += c.bytes_on_disk();
+            st_.written_gc_bytes += c.bytes_on_disk();
             ++st_.gc_copied;
             index_put(std::move(c));
         }
         if (fd >= 0) ::close(fd);
-        st_.disk_bytes -= std::min(st_.disk_bytes, ix_->segs.begin()->second);
-        ix_->segs.erase(ix_->segs.begin());
+        st_.disk_bytes -= std::min(st_.disk_bytes, ix_->segs[old]);
+        ix_->segs.erase(old);
         ::unlink(seg_path(old).c_str());
         ++st_.gc_segments;
         st_.segments = ix_->segs.size();
@@ -460,6 +478,7 @@ bool Store::put_chunk(const Key& k, const Key& parent, int32_t next_token, const
     r.key = k; r.parent = parent; r.next_token = next_token;
     if (!append(r, payload, error)) return false;
     ++st_.chunks_written;
+    st_.written_chunk_bytes += r.bytes_on_disk();
     index_put(std::move(r));
     if (written) *written = true;
     return keep_budget(error);
@@ -473,6 +492,7 @@ bool Store::put_snapshot(const Key& at, int64_t tokens, const std::vector<int32_
     r.key = at; r.tokens = tokens; r.tail = tail; r.flags = flags; r.lineage = lineage;
     if (!append(r, payload, error)) return false;
     ++st_.snapshots_written;
+    st_.written_snapshot_bytes += r.bytes_on_disk();
     index_put(std::move(r));
     return keep_budget(error);
 }
@@ -525,7 +545,11 @@ bool Store::read(const Record& r, const std::vector<Out>& dst, std::string& erro
     return true;
 }
 
-void Store::touch(const Record& r) { const_cast<Record&>(r).used = ++clock_; }
+void Store::touch(const Record& r) {
+    Record& m = const_cast<Record&>(r);
+    m.used = ++clock_;
+    m.used_s = (uint64_t) ::time(nullptr);
+}
 
 bool Store::sync(std::string& error) {
     if (fd_ >= 0 && end_ && ::fdatasync(fd_) != 0) return fail(error, "cannot flush " + seg_path(seg_), errno);

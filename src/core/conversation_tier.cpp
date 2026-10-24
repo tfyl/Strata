@@ -209,9 +209,12 @@ bool ConversationTier::after_request(const SessionState& ss, const ModelGeometry
     if (!on() || checks.empty() || (int64_t) ids.size() < opt_.min_tokens) return true;
     for (const auto& c : checks)
         if (!c.imgs.empty() || !c.stage_parts.empty()) return true;   // text, one GPU: pictures are not stored
+    const auto keys = kvstore::chain_keys(seed(cvec), ids.data(), ids.size());
+    // tfyl.7: over the write budget a conversation is stored only past the raised threshold, or when most of it is
+    // stored already (it keeps growing on disk); the others are read again if they come back
+    if (!admitted(keys, ids)) { ++c_.budget_skipped; return true; }
     const auto t0 = Clock::now();
     if (!ensure_staging(error) || !device_idle(error)) return false;
-    const auto keys = kvstore::chain_keys(seed(cvec), ids.data(), ids.size());
     int64_t deepest = 0;
     for (const auto& c : checks) deepest = std::max<int64_t>(deepest, (int64_t) c.ids.size());
     if (!write_chunks(ss, g, draft, keys, ids, deepest, std::max<int64_t>(rewrite_from, 0), error)) return false;
@@ -230,6 +233,7 @@ bool ConversationTier::after_request(const SessionState& ss, const ModelGeometry
         }
         const uint64_t bytes = c->bytes();
         if (tier_write_now(available, opt_.floor_bytes, bytes)) {
+            if (over_budget() && !(c->branch || c->user_turn)) { ++c_.snapshot_budget_dropped; covered = L; continue; }
             if (!write_snapshot(ss, g, draft, keys, *c, error)) return false;
             ++c_.snapshot_now;
         } else {
@@ -269,6 +273,7 @@ bool ConversationTier::spill(const SessionState& ss, const ModelGeometry& g, con
     if (!on() || it == pending_.end()) return true;
     pending_.erase(it);
     if (c.ids.size() > ids.size() || !std::equal(c.ids.begin(), c.ids.end(), ids.begin())) { ++c_.snapshot_lost; return true; }
+    if (over_budget() && !(c.branch || c.user_turn)) { ++c_.snapshot_budget_dropped; return true; }   // tfyl.7
     if (!ensure_staging(error) || !device_idle(error)) return false;
     const auto keys = kvstore::chain_keys(seed(cvec), ids.data(), ids.size());
     if (!write_snapshot(ss, g, draft, keys, c, error)) return false;
@@ -282,6 +287,70 @@ bool ConversationTier::idle_due() const {
     for (const auto& e : pool_)
         if (!e.on_disk && Clock::now() - e.since >= idle) return true;
     return false;
+}
+
+uint64_t ConversationTier::spent_24h() const {
+    const auto now = Clock::now();
+    const uint64_t w = store_.stats().written_bytes;
+    if (w > spend_seen_) { spend_.push_back({now, w - spend_seen_}); spend_seen_ = w; }
+    const auto day = std::chrono::hours(24);
+    size_t drop = 0;
+    while (drop < spend_.size() && now - spend_[drop].first > day) ++drop;
+    if (drop) spend_.erase(spend_.begin(), spend_.begin() + (std::ptrdiff_t) drop);
+    uint64_t n = 0;
+    for (const auto& s : spend_) n += s.second;
+    return n;
+}
+
+int64_t ConversationTier::admit_min_tokens() const {
+    const uint64_t budget = opt_.budget_bytes_day, spent = spent_24h();
+    if (!budget || spent <= budget) return opt_.min_tokens;
+    // over the budget: min_tokens doubled per quarter of the budget over it (long conversations still get in)
+    const uint64_t quarters = 1 + 4 * (spent - budget) / budget;
+    const int64_t base = std::max<int64_t>(opt_.min_tokens, 1024);
+    return quarters >= 10 ? (int64_t) 1 << 30 : base << quarters;
+}
+
+bool ConversationTier::over_budget() const {
+    return opt_.budget_bytes_day && spent_24h() > opt_.budget_bytes_day;
+}
+
+bool ConversationTier::admitted(const std::vector<kvstore::Key>& keys, const std::vector<int32_t>& ids) const {
+    const int64_t need = admit_min_tokens();
+    if ((int64_t) ids.size() >= need) return true;
+    const size_t whole = keys.size() - 1;
+    return whole > 0 && store_.stored_chunks(keys) * 2 >= whole;   // mostly stored: it goes on
+}
+
+bool ConversationTier::on_path(const kvstore::Key& a, size_t depth_a, const kvstore::Key& b, size_t depth_b) const {
+    if (depth_a > depth_b) return false;
+    kvstore::Key k = b;
+    for (size_t d = depth_b; d > depth_a; --d) {
+        const kvstore::Record* c = store_.chunk(k);
+        if (!c) return false;
+        k = c->parent;
+    }
+    return k == a;
+}
+
+bool ConversationTier::disk_worthy(const PoolEntry& e, bool budget) {
+    const bool fork = e.kept && !e.tip;
+    const size_t je = (size_t) ((e.tokens - (int64_t) e.tail.size()) / kChunk);
+    bool superseded = false;
+    for (const auto& gd : group_disk_)
+        if (gd.first == e.group && gd.second > e.tokens) superseded = true;
+    for (const auto& f : pool_) {
+        if (superseded) break;
+        if (&f == &e || f.cvec != e.cvec || f.tokens <= e.tokens) continue;
+        const size_t jf = (size_t) ((f.tokens - (int64_t) f.tail.size()) / kChunk);
+        if (f.group == e.group || on_path(e.at, je, f.at, jf)) superseded = true;
+    }
+    if (superseded && !fork) { ++c_.snapshot_superseded; return false; }
+    if (budget && opt_.budget_bytes_day && spent_24h() > opt_.budget_bytes_day && !(fork && e.saved >= 2 * opt_.min_gain)) {
+        ++c_.snapshot_budget_dropped;
+        return false;
+    }
+    return true;
 }
 
 uint64_t ConversationTier::pool_bytes() const {
@@ -301,6 +370,11 @@ bool ConversationTier::put_entry(const PoolEntry& e, std::string& error) {
     if (!store_.put_snapshot(e.at, e.tokens, e.tail, c.branch ? kvstore::kFlagBranch : 0, pieces, error, e.lineage))
         return false;
     ++c_.snapshot_writes;
+    bool known = false;
+    for (auto& gd : group_disk_)
+        if (gd.first == e.group) { gd.second = std::max(gd.second, e.tokens); known = true; }
+    if (!known) group_disk_.push_back({e.group, e.tokens});
+    if (group_disk_.size() > 4096) group_disk_.erase(group_disk_.begin(), group_disk_.begin() + 1024);
     return true;
 }
 
@@ -358,6 +432,8 @@ bool ConversationTier::adopt(const SessionState& ss, const ModelGeometry& g, con
         e.saved = L - below;
         e.lineage = (size_t) j < lin.size() ? lin[(size_t) j] : 0;
         e.kept = c.branch || c.user_turn || c.pinned;
+        e.tip = L == (int64_t) ids.size();
+        e.group = group_ + 1;
         e.used = ++clock_;
         e.since = Clock::now();
         e.state = std::move(c);
@@ -371,6 +447,7 @@ bool ConversationTier::adopt(const SessionState& ss, const ModelGeometry& g, con
     }
     std::sort(moved.rbegin(), moved.rend());
     for (size_t i : moved) checks.erase(checks.begin() + (std::ptrdiff_t) i);
+    if (!moved.empty()) ++group_;
     pending_ = keep;
     return trim(available, error);
 }
@@ -384,6 +461,7 @@ bool ConversationTier::tip_worth(const std::vector<int32_t>& ids, const std::vec
     // the usual value gate: min_gain past the deepest point on its path - stored, waiting or pooled - else the
     // conversation comes back to that point and reads the rest again
     const auto keys = kvstore::chain_keys(seed(cvec), ids.data(), ids.size());
+    if (!admitted(keys, ids)) return false;   // tfyl.7: over the budget, past the raised threshold only
     int64_t below = stored_on_path(keys, ids, L - 1);
     for (const int64_t p : pending_) if (p < L) below = std::max(below, p);
     if (const PoolEntry* p = pool_best(keys, ids, cvec, lineages(keys)); p && p->tokens < L) below = std::max(below, p->tokens);
@@ -437,7 +515,7 @@ bool ConversationTier::trim(std::optional<uint64_t> available, std::string& erro
             const double u = tier_utility(rec, double(std::max<int64_t>(e.saved, 0)) / double(smax), e.kept, opt_.alpha);
             if (i == 0 || u < low) { low = u; victim = i; }
         }
-        if (!pool_[victim].on_disk) {
+        if (!pool_[victim].on_disk && disk_worthy(pool_[victim])) {   // tfyl.7: not a superseded one, within budget
             if (!put_entry(pool_[victim], error)) return false;
             ++c_.pool_spilled;
         } else {
@@ -453,6 +531,9 @@ bool ConversationTier::save_pool(bool only_idle, std::string& error) {
     bool wrote = false;
     for (auto& e : pool_) {
         if (e.on_disk || (only_idle && Clock::now() - e.since < idle)) continue;
+        // tfyl.7: a superseded state stays in RAM only (the idle flush and QUIT write the conversation's frontier;
+        // the idle flush within the budget)
+        if (!disk_worthy(e, only_idle)) continue;
         if (!put_entry(e, error)) return false;
         e.on_disk = true;
         wrote = true;
@@ -571,7 +652,7 @@ bool ConversationTier::restore(const Hit& hit, const SessionState& ss, const Mod
 
 std::string ConversationTier::stats_line() const {
     const auto& s = store_.stats();
-    char b[1536];
+    char b[2304];
     std::snprintf(b, sizeof b,
                   "kv store: records=%llu chunks=%llu snapshots=%llu disk_bytes=%llu segments=%llu written_bytes=%llu "
                   "chunk_writes=%llu chunk_dedup=%llu snapshot_writes=%llu snapshot_now=%llu snapshot_deferred=%llu "
@@ -579,7 +660,9 @@ std::string ConversationTier::stats_line() const {
                   "restored_tokens=%llu restore_failures=%llu restore_ms=%.1f persist_ms=%.1f rewrite_same=%llu "
                   "rewrite_differ=%llu draft_lookahead_miss=%llu read_errors=%llu gc_segments=%llu gc_copied=%llu "
                   "gc_dropped=%llu torn=%llu pool_entries=%zu pool_bytes=%llu pool_adopted=%llu pool_restores=%llu "
-                  "pool_spilled=%llu pool_dropped=%llu lineage_skipped=%llu tip_taken=%llu tip_skipped=%llu",
+                  "pool_spilled=%llu pool_dropped=%llu lineage_skipped=%llu tip_taken=%llu tip_skipped=%llu "
+                  "written_chunk_bytes=%llu written_snapshot_bytes=%llu written_gc_bytes=%llu spent_24h=%llu "
+                  "admit_min_tokens=%lld snapshot_superseded=%llu snapshot_budget_dropped=%llu budget_skipped=%llu",
                   (unsigned long long) s.records, (unsigned long long) s.chunks, (unsigned long long) s.snapshots,
                   (unsigned long long) s.disk_bytes, (unsigned long long) s.segments, (unsigned long long) s.written_bytes,
                   (unsigned long long) c_.chunk_writes, (unsigned long long) c_.chunk_dedup,
@@ -595,7 +678,11 @@ std::string ConversationTier::stats_line() const {
                   (unsigned long long) c_.pool_adopted, (unsigned long long) c_.pool_restores,
                   (unsigned long long) c_.pool_spilled, (unsigned long long) c_.pool_dropped,
                   (unsigned long long) c_.lineage_skipped, (unsigned long long) c_.tip_taken,
-                  (unsigned long long) c_.tip_skipped);
+                  (unsigned long long) c_.tip_skipped, (unsigned long long) s.written_chunk_bytes,
+                  (unsigned long long) s.written_snapshot_bytes, (unsigned long long) s.written_gc_bytes,
+                  (unsigned long long) spent_24h(), (long long) admit_min_tokens(),
+                  (unsigned long long) c_.snapshot_superseded, (unsigned long long) c_.snapshot_budget_dropped,
+                  (unsigned long long) c_.budget_skipped);
     return b;
 }
 
