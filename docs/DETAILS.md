@@ -1409,7 +1409,14 @@ in one content-addressed store (no proxy, no whole-session files):
   steering mode). A shared prefix - a system prompt, an earlier turn, a fork - is stored once. After each request
   the chunks below its deepest checkpoint that the store does not hold are written; that happens before the engine
   reads its next command, so it never delays the answer. A chunk the request read again (cells it rewrote) that
-  the store already holds is compared and not written: the first writer stays (`rewrite_same` / `rewrite_differ`).
+  the store already holds is compared: the same bytes stay (`rewrite_same`); other bytes - and on this engine a
+  chunk read again comes out with other bytes every time - replace it (`rewrite_differ`, the newest writer;
+  `v0.2.2-tfyl.6`, which kept the first writer before).
+- *Lineage (`v0.2.2-tfyl.6`).* Every snapshot carries the lineage of the chunks below it when it was taken: a
+  chained digest of their payload digests. A restore takes a snapshot only if the stored chunks under it still have
+  that lineage, so a running state is never mounted over K/V bytes it was not computed from (a chunk replaced since
+  makes the snapshots above it stale; `lineage_skipped` counts the ones a lookup passed over). Snapshots written by
+  `v0.2.2-tfyl.4`/`.5` have no lineage and are not taken.
 - *Snapshots.* A checkpoint's running state (~118 MB) is stored with the tokens past its whole chunks and their K/V.
   Only when it is `--kv-store-min-gain` tokens (4096) past the stored one on its path, or a kept point (a branch
   point, the newest user message, a pin). It waits in RAM, where the conversation's next turn resumes from it
@@ -1442,6 +1449,13 @@ in one content-addressed store (no proxy, no whole-session files):
   goes to disk when it is not there yet (spilled, never refused). States only RAM holds go to disk after
   `--kv-store-idle-s` and at QUIT. `--kv-store-ram-park` parks the K/V image as well; `--kv-store-no-pool` is the
   previous behaviour (park, and write the waiting snapshots at the switch).
+- *Leaving (`v0.2.2-tfyl.6`).* The session leaves a conversation not only when another one is restored, but whenever
+  a prompt leaves the live tokens before their end: a new chat read from token 0 or from a shared root, a fork
+  further back. The tip is then kept - its running state copied off the device, its chunks stored, the ones past
+  the deepest checkpoint compared - when it is `--kv-store-min-gain` tokens past the deepest point on its path
+  (stored, waiting or pooled); a prompt that only re-renders the last turn leaves a tip a few hundred tokens past the
+  turn header, which the gate drops (`tip_taken` / `tip_skipped`). A request of the same conversation keeps the
+  checkpoint it resumes from in the chain.
 
 The request must be `Content-Type: application/json` (else `415`) and come from no browser page, Strata's own or a
 trusted origin (another site's `Origin` gets `403`, also with an API key); the Host and API-key checks apply as

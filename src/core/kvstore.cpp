@@ -24,6 +24,7 @@ Key chain_next(const Key& prev, const int32_t* tokens, size_t n) {
 }
 std::vector<Key> chain_keys(const Key& seed, const int32_t*, size_t) { return {seed}; }
 uint64_t digest(const std::vector<Piece>&) { return 0; }
+uint64_t chain_lineage(uint64_t prev, uint64_t sum) { return prev ^ sum; }
 struct Store::Index {};
 Store::Store() {}
 Store::~Store() {}
@@ -31,9 +32,13 @@ bool Store::open(const Options&, std::string& error) { error = "kv store: not on
 const Record* Store::chunk(const Key&) const { return nullptr; }
 std::vector<const Record*> Store::snapshots_at(const Key&) const { return {}; }
 const Record* Store::best_snapshot(const std::vector<Key>&, const int32_t*, size_t) const { return nullptr; }
+std::vector<const Record*> Store::snapshots_on_path(const std::vector<Key>&, const int32_t*, size_t) const { return {}; }
 size_t Store::stored_chunks(const std::vector<Key>&) const { return 0; }
-bool Store::put_chunk(const Key&, const Key&, int32_t, const std::vector<Piece>&, std::string& e, bool*) { e = "off"; return false; }
-bool Store::put_snapshot(const Key&, int64_t, const std::vector<int32_t>&, uint32_t, const std::vector<Piece>&, std::string& e) {
+bool Store::put_chunk(const Key&, const Key&, int32_t, const std::vector<Piece>&, std::string& e, bool*, bool) {
+    e = "off"; return false;
+}
+bool Store::put_snapshot(const Key&, int64_t, const std::vector<int32_t>&, uint32_t, const std::vector<Piece>&,
+                         std::string& e, uint64_t) {
     e = "off"; return false;
 }
 bool Store::read(const Record&, void*, size_t, std::string& e) { e = "off"; return false; }
@@ -76,6 +81,7 @@ void encode(const Record& r, uint8_t* h) {
     put32(h + 72, (uint32_t) r.next_token);
     put32(h + 76, (uint32_t) r.tail.size());
     put64(h + 80, (uint64_t) r.tokens);
+    put64(h + 1112, r.lineage);   // past the longest tail (88 + 255 * 4); 0 in records written before tfyl.6
     if (!r.tail.empty()) std::memcpy(h + 88, r.tail.data(), r.tail.size() * 4);
     put64(h + kHeaderSum, session_hash64(h, kHeaderSum, kMagic));
 }
@@ -91,6 +97,7 @@ bool decode(const uint8_t* h, Record& r) {
     r.payload = get64(h + 48); r.sum = get64(h + 56); r.seq = get64(h + 64);
     r.next_token = (int32_t) get32(h + 72);
     r.tokens = (int64_t) get64(h + 80);
+    r.lineage = get64(h + 1112);
     r.tail.assign(tail_n, 0);
     if (tail_n) std::memcpy(r.tail.data(), h + 88, tail_n * 4);
     return true;
@@ -139,6 +146,12 @@ std::vector<Key> chain_keys(const Key& seed, const int32_t* tokens, size_t n) {
     for (size_t j = 0; (j + 1) * (size_t) kChunkTokens <= n; ++j)
         keys.push_back(chain_next(keys.back(), tokens + j * (size_t) kChunkTokens, (size_t) kChunkTokens));
     return keys;
+}
+
+uint64_t chain_lineage(uint64_t prev, uint64_t chunk_sum) {
+    const uint64_t v[2] = {prev, chunk_sum};
+    const uint64_t h = session_hash64(v, sizeof v, 0x6c696e6561676532ull);
+    return h ? h : 1;   // 0 is "unknown"
 }
 
 uint64_t digest(const std::vector<Piece>& payload) {
@@ -419,10 +432,29 @@ const Record* Store::best_snapshot(const std::vector<Key>& keys, const int32_t* 
     return nullptr;
 }
 
+std::vector<const Record*> Store::snapshots_on_path(const std::vector<Key>& keys, const int32_t* prompt,
+                                                    size_t n) const {
+    std::vector<const Record*> out;
+    if (keys.empty() || n < 2) return out;
+    const size_t whole = stored_chunks(keys);
+    for (size_t j = whole + 1; j-- > 0;) {
+        const size_t first = out.size();
+        for (const Record* s : snapshots_at(keys[j])) {
+            const size_t base = j * (size_t) kChunkTokens, len = base + s->tail.size();
+            if ((int64_t) len != s->tokens || len >= n) continue;
+            if (!std::equal(s->tail.begin(), s->tail.end(), prompt + base)) continue;
+            out.push_back(s);
+        }
+        std::sort(out.begin() + (std::ptrdiff_t) first, out.end(),
+                  [](const Record* a, const Record* b) { return a->tokens > b->tokens; });
+    }
+    return out;
+}
+
 bool Store::put_chunk(const Key& k, const Key& parent, int32_t next_token, const std::vector<Piece>& payload,
-                      std::string& error, bool* written) {
+                      std::string& error, bool* written, bool replace) {
     if (written) *written = false;
-    if (chunk(k)) return true;
+    if (chunk(k) && !replace) return true;
     Record r;
     r.kind = Kind::chunk;
     r.key = k; r.parent = parent; r.next_token = next_token;
@@ -434,11 +466,11 @@ bool Store::put_chunk(const Key& k, const Key& parent, int32_t next_token, const
 }
 
 bool Store::put_snapshot(const Key& at, int64_t tokens, const std::vector<int32_t>& tail, uint32_t flags,
-                         const std::vector<Piece>& payload, std::string& error) {
+                         const std::vector<Piece>& payload, std::string& error, uint64_t lineage) {
     if (tail.size() > kMaxTail) return fail(error, "snapshot tail longer than a chunk");
     Record r;
     r.kind = Kind::snapshot;
-    r.key = at; r.tokens = tokens; r.tail = tail; r.flags = flags;
+    r.key = at; r.tokens = tokens; r.tail = tail; r.flags = flags; r.lineage = lineage;
     if (!append(r, payload, error)) return false;
     ++st_.snapshots_written;
     index_put(std::move(r));

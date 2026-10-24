@@ -12824,13 +12824,23 @@ int main(int argc, char** argv) {
                 const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
                 std::string e;
                 bool ok = true;
-                if (switching && o.kv_store_pool && live_ok && live_imgs.empty() && kv_tier.covers((int64_t) live.size())) {
+                // tfyl.6: a prompt that leaves the live tokens before their end leaves the conversation too (a new
+                // chat, a fork further back), not only a restore of another one
+                size_t live_shared = 0;
+                if (live_ok) {
+                    const size_t m = std::min(live.size(), ids.size());
+                    while (live_shared < m && (int64_t) live[live_shared] == (int64_t) ids[live_shared]) ++live_shared;
+                }
+                const bool leaving = strata::core::tier_leaves(switching, live_ok, (int64_t) live.size(), (int64_t) live_shared);
+                const int64_t above = switching ? 0 : resume;   // a request of this conversation still mounts at resume
+                if (leaving && o.kv_store_pool && live_imgs.empty() && kv_tier.covers((int64_t) live.size())) {
+                    // the tip's running state off the device only when it is worth keeping (the value gate)
                     ConvCheckpoint tip;
-                    tip.ids = live;
-                    if (gpu_sync_ok() && checkpoint_save(tip, ss, g))
-                        ok = kv_tier.leave(ss, g, tier_draft, cvec_cached, live, checks, std::move(tip), avail, e);
-                    else
-                        ok = kv_tier.adopt(ss, g, tier_draft, cvec_cached, live, checks, 0, avail, e);
+                    if (kv_tier.tip_worth(live, checks, cvec_cached) && gpu_sync_ok()) {
+                        tip.ids = live;
+                        if (!checkpoint_save(tip, ss, g)) tip = ConvCheckpoint{};
+                    }
+                    ok = kv_tier.leave(ss, g, tier_draft, cvec_cached, live, checks, std::move(tip), above, avail, e);
                     tier_log("kv store: the session left the conversation");
                 } else if (kv_tier.waiting_above(switching ? 0 : resume)) {
                     ok = live_ok && kv_tier.adopt(ss, g, tier_draft, cvec_cached, live, checks, switching ? 0 : resume,

@@ -200,10 +200,10 @@ int main() {
     ss.qsa_states[0].host.k_q[(size_t) 2100 * 2 * 256] ^= 0xff;
     check(tier2.after_request(ss, g, &draft, false, ids2, checks2, 2000, short_ram, err), "after the next request");
     check(tier2.counters().rewrite_same == 2 && tier2.counters().rewrite_differ == 1,
-          "chunks 7 and 9 rewritten alike, chunk 8 with other bytes (the first writer stays)");
-    check(tier2.counters().chunk_writes == 5 && tier2.counters().snapshot_now == 1 && !tier2.waiting(),
-          "chunks 10-14 new; RAM short: the snapshot is written at once");
-    ss.qsa_states[0].host.k_q[(size_t) 2100 * 2 * 256] ^= 0xff;
+          "chunks 7 and 9 rewritten alike, chunk 8 with other bytes");
+    check(tier2.counters().chunk_writes == 6 && tier2.counters().snapshot_now == 1 && !tier2.waiting(),
+          "chunk 8 replaced (the newest writer), chunks 10-14 new; RAM short: the snapshot is written at once");
+    // (the pools keep chunk 8's new bytes: the snapshot at 3,900 was taken over them)
     const ConversationTier::Hit hit = tier2.best(ids2, false);
     check(hit.tokens == 3900, "the deepest snapshot on the new path");
     check(!tier2.best(ids2, true).tokens, "the other steering mode does not match");
@@ -278,7 +278,7 @@ int main() {
     check(chunks_a == 12, "A's whole chunks below its turn header");
     const auto beforeA = pools_copy();
     ConversationCheckpoint liveA = checkpoint(ss, g, A, 3500, 33);
-    check(pool.leave(ss, g, &draft, false, A, checksA, std::move(liveA), plenty, err), "the session leaves A");
+    check(pool.leave(ss, g, &draft, false, A, checksA, std::move(liveA), 0, plenty, err), "the session leaves A");
     check(pool.pool_entries() == 3 && checksA.empty() && !pool.waiting(), "its three points moved into the pool");
     check(pool.counters().snapshot_writes == 0 && pool.counters().chunk_writes == 13, "no snapshot written; chunk 13 (to the tip)");
     // B takes the session: its own K/V in the pools
@@ -324,7 +324,7 @@ int main() {
         fill(55);
         check(t.after_request(ss, g, &draft, false, C, checksC, 0, plenty, err), "C's turn");
         const auto beforeC = pools_copy();
-        check(t.leave(ss, g, &draft, false, C, checksC, checkpoint(ss, g, C, 2000, 52), plenty, err) &&
+        check(t.leave(ss, g, &draft, false, C, checksC, checkpoint(ss, g, C, 2000, 52), 0, plenty, err) &&
               t.pool_entries() == 2, "C leaves: two points in RAM");
         std::vector<int32_t> promptC(C);
         promptC.push_back(3);
@@ -338,6 +338,105 @@ int main() {
         check(same_cells(beforeC, ss, g, &draft, 2000), "byte for byte");
         std::string rm3 = "rm -rf '" + o3.dir + "'";
         (void) !std::system(rm3.c_str());
+    }
+
+    // ---- tfyl.6: chunk lineage - a snapshot is only restored over the chunk bytes it was taken over ----
+    {
+        ConversationTier::Options ol = op;
+        ol.dir = dir2 + "-lineage"; ol.pool = false;
+        ConversationTier t;
+        check(t.open(ol, {42, 43}, err), "a lineage store");
+        std::vector<int32_t> P(3000);
+        for (size_t i = 0; i < P.size(); ++i) P[i] = 200000 + (int32_t) i;
+        std::vector<int32_t> p1(P);
+        p1.push_back(9);
+        fill(91);
+        std::vector<ConversationCheckpoint> c1 = {checkpoint(ss, g, P, 2600, 61)};
+        check(t.after_request(ss, g, &draft, false, P, c1, 0, short_ram, err) && t.best(p1, false).tokens == 2600,
+              "a snapshot over chunks 0-9");
+        // the next request reads from 1,000 again and chunk 5 (1,280-1,536) comes out with other bytes: the stored
+        // chunk is replaced, and the snapshot at 2,600 - taken over the old chunk 5 - must not be served with it
+        ss.qsa_states[3].host.k_q[(size_t) 1300 * 2 * 256] ^= 0x5a;
+        std::vector<ConversationCheckpoint> c2 = {checkpoint(ss, g, P, 2000, 62)};
+        check(t.after_request(ss, g, &draft, false, P, c2, 1000, plenty, err) && t.counters().rewrite_differ == 1,
+              "chunk 5 read again with other bytes: replaced");
+        const ConversationTier::Hit stale = t.best(p1, false);
+        check(stale.tokens == 0 && t.counters().lineage_skipped >= 1,
+              "the snapshot over the old chunk 5 is not served (tfyl.5 served it: new chunk 5, old state - the mix)");
+        check(t.flush(ss, g, &draft, false, P, c2, err) && t.best(p1, false).tokens == 2000,
+              "the snapshot over the new bytes is");
+        const auto beforeL = pools_copy();
+        wipe();
+        ConversationCheckpoint outL;
+        check(t.restore(t.best(p1, false), ss, g, &draft, p1, outL, err) && outL.gdn == c2[0].gdn &&
+              same_cells(beforeL, ss, g, &draft, 2000), "restored over the chunks it was taken over, byte for byte");
+        // a reopen keeps both the replacement and the lineage
+        ConversationTier t2;
+        check(t2.open(ol, {42, 43}, err) && t2.best(p1, false).tokens == 2000, "after a reopen too");
+        std::string rm4 = "rm -rf '" + ol.dir + "'";
+        (void) !std::system(rm4.c_str());
+    }
+    // the pool: an entry taken over a chunk another request then replaces is not served either
+    {
+        ConversationTier::Options olp = op;
+        olp.dir = dir2 + "-lineage-pool";
+        ConversationTier t;
+        check(t.open(olp, {42, 43}, err), "a lineage store with the pool");
+        std::vector<int32_t> Q(2000);
+        for (size_t i = 0; i < Q.size(); ++i) Q[i] = 300000 + (int32_t) i;
+        std::vector<int32_t> q1(Q);
+        q1.push_back(4);
+        fill(93);
+        std::vector<ConversationCheckpoint> cq = {checkpoint(ss, g, Q, 1500, 71)};
+        cq.back().user_turn = true;
+        check(t.after_request(ss, g, &draft, false, Q, cq, 0, plenty, err) &&
+              t.leave(ss, g, &draft, false, Q, cq, checkpoint(ss, g, Q, 2000, 72), 0, plenty, err) &&
+              t.pool_entries() == 2 && t.best(q1, false).pooled, "two pooled points");
+        ss.qsa_states[0].host.k_q[(size_t) 600 * 2 * 256] ^= 0x33;   // chunk 2 differs on a re-read
+        std::vector<ConversationCheckpoint> cr = {checkpoint(ss, g, Q, 1800, 73)};
+        check(t.after_request(ss, g, &draft, false, Q, cr, 500, plenty, err) && t.counters().rewrite_differ >= 1,
+              "chunk 2 replaced");
+        check(t.best(q1, false).tokens == 0, "neither pooled state (both over the old chunk 2) is served");
+        std::string rm5 = "rm -rf '" + olp.dir + "'";
+        (void) !std::system(rm5.c_str());
+    }
+
+    // ---- tfyl.6: the leave path ----
+    {
+        check(tier_leaves(true, true, 5000, 5000), "another conversation comes in");
+        check(tier_leaves(false, true, 5000, 3000), "the prompt leaves the live tokens before their end");
+        check(!tier_leaves(false, true, 5000, 5000), "the prompt continues them: no leave");
+        check(!tier_leaves(true, false, 5000, 0) && !tier_leaves(false, true, 0, 0), "nothing live");
+        ConversationTier::Options ov = op;
+        ov.dir = dir2 + "-leave"; ov.min_gain = 1000;
+        ConversationTier t;
+        check(t.open(ov, {42, 43}, err), "a leave store");
+        std::vector<int32_t> R(3600);
+        for (size_t i = 0; i < R.size(); ++i) R[i] = 400000 + (int32_t) i;
+        fill(97);
+        // checkpoints at 1,000 (where the next request of this conversation resumes) and 2,100; the tip at 3,600
+        std::vector<ConversationCheckpoint> cl = {checkpoint(ss, g, R, 1000, 81), checkpoint(ss, g, R, 2100, 82)};
+        cl[0].user_turn = true;
+        check(t.after_request(ss, g, &draft, false, R, cl, 0, plenty, err) && t.waiting(), "two waiting");
+        check(t.tip_worth(R, cl, false), "the tip is 1,500 past the deepest point: worth a state");
+        std::vector<int32_t> near(R.begin(), R.begin() + 2400);
+        check(!t.tip_worth(near, cl, false), "a tip 300 past the deepest point is not (the value gate)");
+        // a fork of this conversation at 1,000 (not another conversation): it leaves above 1,000
+        const uint64_t writes0 = t.counters().chunk_writes;
+        check(t.leave(ss, g, &draft, false, R, cl, checkpoint(ss, g, R, 3600, 83), 1000, plenty, err), "left");
+        check(cl.size() == 1 && cl[0].ids.size() == 1000, "the checkpoint it resumes from stays in the chain");
+        check(t.pool_entries() == 2 && t.counters().tip_taken == 1, "2,100 and the tip went to the pool");
+        check(t.counters().chunk_writes == writes0 + 6, "chunks 8-13 up to the tip stored with it");
+        std::vector<int32_t> r1(R);
+        r1.push_back(5);
+        check(t.best(r1, false).tokens == 3600 && t.best(r1, false).pooled, "it comes back at its exact tip");
+        // a tip within the gate: skipped, nothing written for it
+        std::vector<ConversationCheckpoint> cn = {checkpoint(ss, g, near, 2000, 84)};
+        const uint64_t writes1 = t.counters().chunk_writes;
+        check(t.leave(ss, g, &draft, false, near, cn, checkpoint(ss, g, near, 2400, 85), 0, plenty, err) &&
+              t.counters().tip_skipped == 1 && t.counters().chunk_writes == writes1, "a near tip is skipped");
+        std::string rm6 = "rm -rf '" + ov.dir + "'";
+        (void) !std::system(rm6.c_str());
     }
     std::string rm2 = "rm -rf '" + dir2 + "'";
     (void) !std::system(rm2.c_str());

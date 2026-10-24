@@ -39,6 +39,14 @@ inline bool tier_snapshot_worth(int64_t tokens, int64_t stored, bool kept, int64
 inline bool tier_write_now(std::optional<uint64_t> available, uint64_t floor, uint64_t snapshot_bytes) {
     return !available || *available < floor + 2 * snapshot_bytes;
 }
+/// tfyl.6: whether a request makes the session leave its live conversation, so that conversation's tip is kept
+/// (subject to the value gate) before the pools are rewritten: another conversation comes in (a restore, a borrow,
+/// a batch slot), or the prompt leaves the live tokens before their end - a new chat read from token 0 or from a
+/// shared root, a side request that forks off further back.  A prompt that only re-renders the last turn leaves too;
+/// its tip is then a few hundred tokens past the turn header and the value gate drops it.
+inline bool tier_leaves(bool switching, bool live_ok, int64_t live_tokens, int64_t shared_with_live) {
+    return live_ok && live_tokens > 0 && (switching || shared_with_live < live_tokens);
+}
 /// Stage 3: how many bytes the RAM snapshot pool may hold - what is available above the floor and a headroom, the
 /// pool's own bytes counted as its own (they come back when it shrinks), at least `min_entries` snapshots (the
 /// live resume point and the newest user message of the conversation that just left).  Unknown RAM: the minimum.
@@ -84,7 +92,7 @@ public:
         uint64_t persists = 0, chunk_writes = 0, chunk_dedup = 0, snapshot_writes = 0, snapshot_skipped = 0;
         uint64_t snapshot_now = 0, snapshot_deferred = 0, snapshot_spilled = 0, snapshot_lost = 0;
         uint64_t restores = 0, restored_tokens = 0, restore_failures = 0, draft_lookahead_miss = 0;
-        uint64_t rewrite_same = 0, rewrite_differ = 0;
+        uint64_t rewrite_same = 0, rewrite_differ = 0, lineage_skipped = 0, tip_taken = 0, tip_skipped = 0;
         uint64_t pool_adopted = 0, pool_restores = 0, pool_spilled = 0, pool_dropped = 0;
         double restore_ms = 0, persist_ms = 0;
     };
@@ -129,13 +137,19 @@ public:
     bool adopt(const SessionState& ss, const ModelGeometry& g, const QsaState* draft, bool cvec,
                const std::vector<int32_t>& ids, std::vector<ConversationCheckpoint>& checks, int64_t above,
                std::optional<uint64_t> available, std::string& error);
-    /// The session leaves this conversation for another one: its K/V up to the live tip is stored (whole chunks),
-    /// `live_state` (the running state at the tip, ids = `ids`) joins the waiting snapshots as a kept point, and
-    /// everything waiting moves into the pool (adopt).  So a conversation that comes back resumes exactly where it
-    /// left - an agent that echoes its reply continues from the tip - without a RAM-parked K/V image.
+    /// The session leaves this conversation (tier_leaves): `live_state` (the running state at the tip, ids = `ids`)
+    /// joins the waiting snapshots as a kept point when it is min_gain past the deepest point on its path (stored,
+    /// waiting or pooled), with the K/V up to the tip stored (the chunks past the deepest checkpoint compared, so the
+    /// tip's lineage is the bytes it was taken over), and everything waiting longer than `above` moves into the pool
+    /// (adopt; `above`: where this request resumes, 0 for another conversation).  So a conversation that comes back
+    /// resumes where it left - an agent that echoes its reply continues from the tip - without a parked K/V image.
+    /// Whether this conversation's tip (ids.size()) is worth a state when the session leaves it - checked before the
+    /// caller copies the running state off the device.
+    bool tip_worth(const std::vector<int32_t>& ids, const std::vector<ConversationCheckpoint>& checks, bool cvec) const;
     bool leave(const SessionState& ss, const ModelGeometry& g, const QsaState* draft, bool cvec,
                const std::vector<int32_t>& ids, std::vector<ConversationCheckpoint>& checks,
-               ConversationCheckpoint&& live_state, std::optional<uint64_t> available, std::string& error);
+               ConversationCheckpoint&& live_state, int64_t above, std::optional<uint64_t> available,
+               std::string& error);
     /// The pool to its capacity for `available` RAM: the lowest Marconi utility goes first, to disk when it is not
     /// stored yet (spilled), else just dropped.
     bool trim(std::optional<uint64_t> available, std::string& error);
@@ -175,13 +189,19 @@ private:
         int64_t tokens = 0, saved = 0;      // its length; the tokens it saves over the next point on its path
         uint64_t used = 0;
         bool kept = false, on_disk = false;
+        uint64_t lineage = 0;               // the chunks below it when it was taken (kvstore Record::lineage)
         std::chrono::steady_clock::time_point since{};
         size_t bytes() const { return state.bytes() + tail_kv.capacity() + tail.capacity() * 4; }
     };
     bool put_entry(const PoolEntry& e, std::string& error);
     const PoolEntry* pool_best(const std::vector<kvstore::Key>& keys, const std::vector<int32_t>& prompt, bool cvec,
-                               size_t whole) const;
+                               const std::vector<uint64_t>& lin) const;
     int64_t stored_on_path(const std::vector<kvstore::Key>& keys, const std::vector<int32_t>& ids, int64_t tokens) const;
+    /// lin[j] = the lineage of the stored chunks keys[1..j], for as long as they are all stored.
+    std::vector<uint64_t> lineages(const std::vector<kvstore::Key>& keys) const;
+    /// The deepest stored snapshot on the path whose lineage is the stored chunks' (nullptr: none).
+    const kvstore::Record* valid_snapshot(const std::vector<kvstore::Key>& keys, const std::vector<uint64_t>& lin,
+                                          const int32_t* prompt, size_t n) const;
     kvstore::Key seed(bool cvec) const;
     bool ensure_staging(std::string& error);
 
@@ -193,7 +213,7 @@ private:
     std::vector<PoolEntry> pool_;    // stage 3: states of conversations that left the session
     uint64_t clock_ = 0;
     std::chrono::steady_clock::time_point last_request_{};
-    Counters c_;
+    mutable Counters c_;   // (lineage_skipped counts in the const lookups)
 };
 
 }  // namespace strata::core
