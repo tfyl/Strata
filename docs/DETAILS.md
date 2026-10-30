@@ -739,6 +739,50 @@ stage. Parked snapshots are not kept across restarts; session files are. `STRATA
 retention for diagnostics. The Monitor tab's **Conversation cache** card shows parked, restored and evicted counts and the
 prompt tokens the cache gave back; `/metrics` has the same under `"conversation_cache"`.
 
+### The disk tier (tfyl fork, `--kv-store DIR`)
+
+The engine keeps conversations on disk itself, beside the RAM cache, in one content-addressed store (no proxy, no
+whole-session files).
+
+- *Chunks.* A conversation's K/V is cut into 256-token chunks keyed by a chained hash (the key after j chunks hashes the key
+  after j - 1 with the chunk's token ids, from a seed of everything the bytes depend on: the session file's model and config
+  fingerprints, the geometry, the layer carve, every K/V part's format, the steering mode). A shared prefix is stored once.
+  After each request the chunks below its deepest checkpoint that the store does not hold are written, before the engine reads
+  its next command. A chunk read again with other bytes replaces the stored one (`rewrite_same` / `rewrite_differ`).
+- *Lineage.* Every snapshot carries a chained digest of the chunk payloads below it; a restore takes it only if the stored
+  chunks still match, so a running state is never mounted over K/V it was not computed from (`lineage_skipped`).
+- *Snapshots.* A checkpoint's running state (~118 MB) with the tokens past its whole chunks, stored when it is
+  `--kv-store-min-gain` (4096) tokens past the stored one on its path, or a kept point (a branch point, the newest user
+  message, a pin). It waits in RAM and is written when its conversation leaves the session, when retention drops it, after
+  `--kv-store-idle-s` (300) without requests (the server sends `KVSTORE IDLE` once a minute), at QUIT, or at once when RAM is
+  short. A crash loses only the ones still waiting.
+- *Restore.* A prompt that matches nothing in RAM as deep as the store's deepest snapshot on its path (by 1/64 of it, 256 tokens
+  at least) restores from disk: the chunks and tail into the K/V pools in 32 MiB batches, the running state as the checkpoint it
+  resumes from. A read or digest failure reads the prompt from token 0. Like a parked restore (#2409), a card with under 64 MiB
+  free and no copy stream yet skips it.
+- *One cache across the tiers.* A conversation the store keeps (`--kv-store-min-tokens` or more, text only) parks no K/V image
+  in RAM when another takes the session: its running states (the live tip, the newest user message, the waiting snapshots) go
+  into a RAM pool of at most `--kv-store-pool-mib` (1536, less when RAM is short), and it comes back from the pool and its chunks
+  on disk. Under pressure the lowest-utility state leaves first, to disk when it is not there yet. `--kv-store-ram-park` parks the
+  image as well; `--kv-store-no-pool` writes the snapshots at the switch instead.
+- *Leaving.* The session also leaves a conversation when a prompt leaves the live tokens before their end (a new chat, a fork
+  further back). The tip is kept when it is `--kv-store-min-gain` past the deepest point on its path (`tip_taken` /
+  `tip_skipped`).
+- *What reaches disk.* A state reaches disk only when no deeper state of its conversation is in the pool or on disk (the
+  frontier; fork points are exempt, `snapshot_superseded`). The collection takes the segment with the least live data among the
+  oldest 16 and copies forward only what was used in the last 24 h. `--kv-store-gib-day N` (0 = off) is a rolling write budget:
+  over it, a new conversation is stored only once it reaches `--kv-store-min-tokens` doubled per quarter of the budget it is
+  over, and only fork points that save twice `--kv-store-min-gain` are written as snapshots (`spent_24h`, `admit_min_tokens`,
+  `budget_skipped`, `snapshot_budget_dropped`).
+- *On disk.* Append-only `seg-NNNNNNNN.kvs` files of at most 256 MiB, written with O_DIRECT and no fsync per record; a digest on
+  every header and payload drops a torn write when the store opens (it rebuilds its index from the headers). Over
+  `--kv-store-gib` (100) segments are collected as above.
+- *Limits.* One GPU, `--prompt-cache` > 0, no `--batch` or `--peer-device`, text only, POSIX only. RAM: a 32 MiB staging buffer,
+  a 16 MiB I/O buffer, ~150 bytes a record for the index, and the pool. SAVE / RESTORE still export single conversations.
+- *Metrics.* The engine logs `kv store: k=v ...` after each operation (`written_chunk_bytes`, `written_snapshot_bytes`,
+  `written_gc_bytes` among them); `/metrics` carries it under `conversation_cache.kv_store` and as `strata:kv_store_*`.
+  `KVSTORE STATS` / `KVSTORE FLUSH` answer the same.
+
 ### Session files (disk)
 
 The conversation the engine holds can be saved to a file and restored later, also after a restart of the same engine version,
