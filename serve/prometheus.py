@@ -157,7 +157,8 @@ def strata(m: dict, out: list, lab: str):
             metric(name, "gauge", help_, g.get(key), f',gpu="{g.get("index")}"')
     # tfyl: the conversation cache's disk tier (--kv-store), as the engine's log reports it
     kv = ((m.get("conversation_cache") or {}).get("kv_store")) or {}
-    gauges = {"records", "chunks", "snapshots", "disk_bytes", "segments", "waiting"}
+    gauges = {"records", "chunks", "snapshots", "disk_bytes", "segments", "waiting", "pool_entries", "pool_bytes",
+              "spent_24h", "admit_min_tokens"}
     for k in sorted(kv):
         metric(f"kv_store_{k}" + ("" if k in gauges else "_total"), "gauge" if k in gauges else "counter",
                f"The disk tier's {k.replace('_', ' ')} (conversation_cache.kv_store.{k}).", kv.get(k))

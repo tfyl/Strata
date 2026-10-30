@@ -252,6 +252,38 @@ class ConversationCacheCard(unittest.TestCase):
             self.assertIn('strata:kv_store_restores_total{model="m"} 1', text)
             self.assertIn("# TYPE strata:kv_store_rewrite_differ_total counter", text)
 
+    def test_the_tfyl7_kv_store_line(self):
+        """tfyl: the line v0.2.2-tfyl.7 logs (a key with digits, spent_24h, broke the parse); the budget's figures are gauges."""
+        from serve.server import ConvCacheLog
+        from serve import prometheus
+        import tempfile
+        line = ("strata serve: kv store: the session left the conversation; kv store: records=30504 chunks=29936 "
+                "snapshots=568 disk_bytes=163873722368 segments=670 written_bytes=2886397952 chunk_writes=570 "
+                "chunk_dedup=3807 snapshot_writes=9 snapshot_now=0 snapshot_deferred=15 snapshot_spilled=3 "
+                "snapshot_skipped=123 snapshot_lost=0 waiting=0 restores=1 restored_tokens=39100 restore_failures=0 "
+                "restore_ms=213.2 persist_ms=1540.4 rewrite_same=150 rewrite_differ=206 draft_lookahead_miss=0 "
+                "read_errors=0 gc_segments=0 gc_copied=0 gc_dropped=0 torn=0 pool_entries=8 pool_bytes=962393464 "
+                "pool_adopted=10 pool_restores=1 pool_spilled=0 pool_dropped=0 lineage_skipped=89 tip_taken=0 "
+                "tip_skipped=12 written_chunk_bytes=1809408000 written_snapshot_bytes=1076989952 written_gc_bytes=0 "
+                "spent_24h=2886397952 admit_min_tokens=15000 snapshot_superseded=42 snapshot_budget_dropped=0 "
+                "budget_skipped=0\n")
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text(line, encoding="utf-8")
+            kv = ConvCacheLog().poll(str(log), 0)["kv_store"]
+            self.assertEqual(len(kv), 45)   # every pair of the line
+            self.assertEqual((kv["spent_24h"], kv["admit_min_tokens"], kv["written_chunk_bytes"]),
+                             (2886397952, 15000, 1809408000))
+            self.assertEqual((kv["disk_bytes"], kv["budget_skipped"], kv["persist_ms"]), (163873722368, 0, 1540.4))
+            out = []
+            prometheus.strata({"conversation_cache": {"kv_store": kv}}, out, 'model="m"')
+            text = "\n".join(out)
+            self.assertIn('strata:kv_store_spent_24h{model="m"} 2886397952', text)
+            self.assertIn("# TYPE strata:kv_store_spent_24h gauge", text)
+            self.assertIn("# TYPE strata:kv_store_admit_min_tokens gauge", text)
+            self.assertIn("# TYPE strata:kv_store_pool_bytes gauge", text)
+            self.assertIn('strata:kv_store_written_chunk_bytes_total{model="m"} 1809408000', text)
+
     def test_metrics(self):
         tok = ByteTokenizer()
         engine = MockEngine(tok, "Thought.</think>\nHello.", max_context=4096)
