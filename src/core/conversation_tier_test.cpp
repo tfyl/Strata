@@ -33,6 +33,17 @@ cudaError_t cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned) { return cu
 cudaError_t cudaEventRecord(cudaEvent_t, cudaStream_t) { return cudaSuccess; }
 cudaError_t cudaEventCreateWithFlags(cudaEvent_t* e, unsigned) { *e = nullptr; return cudaSuccess; }
 const char* cudaGetErrorString(cudaError_t) { return "stub"; }
+// 0.2.8's snapshot code links these too (the opt-in VRAM park and the async park); no device memory here
+cudaError_t cudaSetDevice(int) { return cudaSuccess; }
+cudaError_t cudaMalloc(void**, size_t) { return cudaErrorMemoryAllocation; }
+cudaError_t cudaFree(void*) { return cudaSuccess; }
+cudaError_t cudaMallocHost(void** p, size_t n) { *p = std::malloc(n); return *p ? cudaSuccess : cudaErrorMemoryAllocation; }
+cudaError_t cudaFreeHost(void* p) { std::free(p); return cudaSuccess; }
+cudaError_t cudaMemGetInfo(size_t* fr, size_t* tot) { *fr = *tot = (size_t) 8 << 30; return cudaSuccess; }
+cudaError_t cudaPointerGetAttributes(cudaPointerAttributes* a, const void*) { *a = {}; a->type = cudaMemoryTypeHost; return cudaSuccess; }
+cudaError_t cudaEventSynchronize(cudaEvent_t) { return cudaSuccess; }
+cudaError_t cudaEventDestroy(cudaEvent_t) { return cudaSuccess; }
+cudaError_t cudaStreamDestroy(cudaStream_t) { return cudaSuccess; }
 }
 namespace strata::kernels {
 void kv_stream_reset(const KvStreamMap&, void*) { ++g_stream_resets; }
