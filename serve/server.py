@@ -795,7 +795,7 @@ class ConvCacheLog:
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
     # tfyl: the disk tier (--kv-store): "strata serve: <what>; kv store: k=v k=v ..." after each of its operations
-    KV_STORE = re.compile(r"kv store: ((?:[a-z_]+=[-0-9.]+ ?)+)$")
+    KV_STORE = re.compile(r"kv store: ((?:[a-z0-9_]+=[-0-9.]+ ?)+)$")   # keys have digits too (spent_24h)
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
