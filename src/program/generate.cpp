@@ -14509,8 +14509,24 @@ int main(int argc, char** argv) {
             if (kv_tier.on() && req_imgs.empty() && o.prompt_cache > 0)
                 store_hit = kv_tier.best(tier_ids(ids, ids.size()), want_cvec);
             const int64_t ram_best = std::max({resume, slot_tokens, parked.tokens});
-            const bool use_store = store_hit.tokens > 0 &&
-                                   store_hit.tokens - ram_best >= std::max<int64_t>(256, store_hit.tokens / 64);
+            bool use_store = store_hit.tokens > 0 &&
+                             store_hit.tokens - ram_best >= std::max<int64_t>(256, store_hit.tokens / 64);
+            if (use_store) {   // tfyl: the store's restore copies through this thread's stream as well (#2409)
+                int cur = 0;
+                size_t fb = 0, tb = 0;
+                if (cudaGetDevice(&cur) == cudaSuccess && cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
+                    const uint8_t ready = strata::core::conversation_copy_stream_ready(cur) ? 1 : 0;
+                    const uint64_t free_b = (uint64_t) fb;
+                    if (!strata::program::conv_cache::restore_fits(&free_b, &ready, 1,
+                                                                   strata::program::conv_cache::kRestoreFirstUseMib << 20)) {
+                        std::fprintf(stderr, "strata serve: kv store: skip restore (CUDA0 has %lld MiB free and no copy "
+                                             "stream yet); rereading the prompt\n", (long long) (free_b >> 20));
+                        use_store = false;
+                    }
+                } else {
+                    (void) cudaGetLastError();   // no sample: the restore goes ahead, as #2409's does
+                }
+            }
             std::optional<strata::core::SavedConversation> incoming;
             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
             // borrowed: its K/V up to there and the checkpoint come over, and that conversation stays parked for its
