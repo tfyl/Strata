@@ -3,7 +3,8 @@
 // runtime is a stub whose copies are memcpy, so the real layout, part and lane code moves the bytes.  It checks:
 // chunks and a snapshot written after a request, the pools wiped, the conversation restored byte for byte with its
 // running state; the rewrite counters; a snapshot written at once when RAM is short, or spilled when retention drops
-// it; another identity, a diverging prompt and a shorter prompt; and a reopen.
+// it; another identity, a diverging prompt and a shorter prompt; and a reopen.  A snapshot whose tip is inside an open
+// compression group of the indexer comes back and mounts with that group's saved state.
 //
 // Not in the CUDA build (it defines the runtime's symbols itself).  Build:
 //   g++ -std=c++20 -Iinclude -I<cuda>/include src/core/conversation_tier_test.cpp src/core/conversation_tier.cpp \
@@ -150,8 +151,18 @@ bool same_cells(const std::vector<std::vector<uint8_t>>& before, const SessionSt
             if (g_pools[i].p == base) want = before[i].data();
         const size_t n = l.bytes(cells);
         std::vector<uint8_t> got(n);
-        if (!want || !conversation_kv_part_cells(st, g, l.index, l.part, 0, cells, got.data(), false, e) ||
-            std::memcmp(got.data(), want, n) != 0) return false;
+        if (!want || !conversation_kv_part_cells(st, g, l.index, l.part, 0, cells, got.data(), false, e)) {
+            std::fprintf(stderr, "  lane %d part %d: %s\n", (int) l.index, (int) l.part, want ? e.c_str() : "no copy");
+            return false;
+        }
+        if (std::memcmp(got.data(), want, n) != 0) {
+            size_t at = 0;
+            while (at < n && got[at] == want[at]) ++at;
+            std::fprintf(stderr, "  lane %s %d part %d: byte %zu of %zu differs (per %zu, row cells %lld)\n",
+                         l.state == draft ? "draft" : "main", (int) l.index, (int) l.part, at, n, l.per,
+                         (long long) l.row_cells);
+            return false;
+        }
     }
     return true;
 }
@@ -238,6 +249,64 @@ int main() {
     check(tier2.counters().restores == 1 && tier2.counters().restored_tokens == 3900, "counted");
     // the draft's last cell of chunk 14 (3,584-3,840) was made for token 3,840 of the old turn: same here
     check(tier2.counters().draft_lookahead_miss == 0, "no draft lookahead miss on the same path");
+
+    // a snapshot inside an open compression group: the indexer pools one key per 4 cells, and 3,903 leaves cells
+    // 3,900-3,902 in the open group (their raw keys in idx_tail, row 975 of idx_pooled the spare).  The chunks are 256
+    // cells, so a chunk boundary is always a group boundary and only the snapshot's own tip is ever inside a group.
+    // The open group is SAVED, not recomputed: the closed blocks' pooled rows come back with the cells, the raw tail,
+    // the spare's key and the block positions with the running state, and mounting it rebuilds the spare row.
+    {
+        char tg[] = "/tmp/tier-group-XXXXXX";
+        const std::string gdir = std::string(mkdtemp(tg)) + "/store";
+        ConversationTier::Options og = o;
+        og.dir = gdir; og.min_gain = 64;
+        ConversationTier tg4;
+        check(tg4.open(og, {42, 46}, err), "open (open group)");
+        constexpr int64_t kTip = 3903;
+        static_assert(kTip % 4 == 3 && kTip % 256 != 0, "the tip sits three cells into an open group, mid chunk");
+        std::vector<ConversationCheckpoint> cg = {checkpoint(ss, g, ids2, (size_t) kTip, 9)};
+        fill(23);
+        const auto bg = pools_copy();
+        check(tg4.after_request(ss, g, &draft, false, ids2, cg, 0, short_ram, err) && !tg4.waiting(),
+              "the open-group snapshot written");
+        std::vector<int32_t> pg(ids2);
+        pg.push_back(5);
+        check(tg4.best(pg, false).tokens == kTip, "it is the deepest point on the path");
+        wipe();
+        ConversationCheckpoint og_out;
+        check(tg4.restore(tg4.best(pg, false), ss, g, &draft, pg, og_out, err), "restored (open group)");
+        check(og_out.tails == cg[0].tails && og_out.dead == cg[0].dead && og_out.block_pos == cg[0].block_pos,
+              "the open group's raw keys, the spare's key and the block positions come back as saved");
+        // the snapshot holds whole pages (4 cells): through the tip's page, so the open group's three cells and the
+        // pooled rows through the spare (row 975) are compared too
+        check(same_cells(bg, ss, g, &draft, kTip + 1), "the cells through the tip's page and their pooled rows, byte for byte");
+        // the mount (what the serve loop does with the restored checkpoint): the indexer state the next token reads.
+        // It writes the whole running state, so the session gets buffers of the real size first (8 bytes above)
+        ConversationStateSizes zg;
+        check(conversation_session_sizes(g, ss, zg, err), "state sizes (open group)");
+        float* const gdn0 = ss.gdn_state;
+        float* const ple0 = ss.ple_hist;
+        ss.gdn_state = alloc<float>(zg.gdn);
+        ss.ple_hist = alloc<float>(zg.ple);
+        check(conversation_checkpoint_restore(og_out, ss, g, err), "mounted");
+        check(std::memcmp(ss.gdn_state, cg[0].gdn.data(), zg.gdn) == 0 && std::memcmp(ss.ple_hist, cg[0].ple.data(), zg.ple) == 0,
+              "the mounted GDN state and PLE history are the saved ones");
+        const size_t spare = (size_t) (kTip / 4) * (size_t) g.idx_key_dim;
+        bool open_ok = true;
+        for (int64_t j = 0; j < g.n_qsa_layers(); ++j) {
+            const QsaState& st = ss.qsa_states[j];
+            open_ok = open_ok &&
+                      std::memcmp(st.idx_tail, cg[0].tails.data() + j * zg.tail, zg.tail) == 0 &&
+                      std::memcmp(st.idx_dead, cg[0].dead.data() + j * zg.dead, zg.dead) == 0 &&
+                      std::memcmp(st.idx_block_pos, cg[0].block_pos.data() + j * zg.block_pos, zg.block_pos) == 0 &&
+                      std::memcmp(st.idx_pooled + spare, cg[0].dead.data() + j * zg.dead, zg.dead) == 0;
+        }
+        check(open_ok, "after the mount every layer's idx_tail, idx_dead, block positions and spare row are the saved ones");
+        ss.gdn_state = gdn0;
+        ss.ple_hist = ple0;
+        std::string rmg = "rm -rf '" + gdir.substr(0, gdir.rfind('/')) + "'";
+        (void) !std::system(rmg.c_str());
+    }
 
     // a prompt that leaves the path at 1,500: the user-message snapshot (1,100) is the deepest it can use
     std::vector<int32_t> fork(ids2.begin(), ids2.begin() + 2000);
