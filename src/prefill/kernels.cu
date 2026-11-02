@@ -3035,6 +3035,21 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
                     e = gdn_rec_tc(state, h, gate, beta, y, T, cs, true, tc_np, tcnp, tcl);
                     if (e == cudaSuccess) { sel = kGdnTcSplit; why = ""; normed = tcnp != nullptr; }
                 }
+                // tfyl: say once which way STRATA_GDN_TC=1 went - the gate (SMs, shared memory, sm_80) and the 60 MB scratch
+                // allocated on first use otherwise fall back to the kernels below without a word, and a scratch that
+                // could not be had is asked for again on the next prompt, so a "not taken" line then a "runs" line
+                // means some prompts were read on each path
+                static bool said_on = false, said_off = false;
+                if (sel != kGdnNone && !said_on) {
+                    said_on = true;
+                    std::fprintf(stderr, "strata: STRATA_GDN_TC=1: the GDN recurrence runs on the tensor cores (%s plan, %d value tile%s)\n",
+                                 sel == kGdnTcSplit ? "split" : "double-buffered", sel == kGdnTcSplit ? tcl : 1,
+                                 sel == kGdnTcSplit && tcl == 2 ? "s" : "");
+                } else if (sel == kGdnNone && !said_off) {
+                    said_off = true;
+                    std::fprintf(stderr, "strata: STRATA_GDN_TC=1 not taken (%s): this prompt's GDN recurrence runs the default kernels\n",
+                                 e == cudaErrorMemoryAllocation ? "no room for its 60 MB scratch" : "the card does not fit its gate");
+                }
             }
             if (sel == kGdnNone && chunked && T >= kGdnChunkedMin) {
                 if (wanted == kGdnAuto) wanted = kGdnChunked;
