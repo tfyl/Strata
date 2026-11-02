@@ -134,6 +134,7 @@
 #if !defined(__APPLE__)   // major() / minor(): <sys/types.h> on macOS
 #include <sys/sysmacros.h>
 #endif
+extern char** environ;   // the session config fingerprint's STRATA_* switches (tfyl)
 #endif
 
 #include <cuda_runtime.h>
@@ -10523,6 +10524,45 @@ int main(int argc, char** argv) {
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
         // K/V format and the arithmetic switches.  Sampling, seeds, draft tuning and the expert tier are not in it.
         std::optional<uint64_t> model_fp, config_fp;
+        // tfyl: the kernels behind the numbers (session_env_switches): the environment as it is now, once every
+        // default the engine sets for itself is set (main's start) and before any request, so every start with the
+        // same config and card snapshots the same set whenever the first save or lookup happens
+        std::vector<std::pair<std::string, int64_t>> numerics_switches;
+        {
+            std::vector<std::string> env;
+#if defined(_WIN32)
+            for (char** p = _environ; p != nullptr && *p != nullptr; ++p) env.emplace_back(*p);
+#else
+            for (char** p = environ; p != nullptr && *p != nullptr; ++p) env.emplace_back(*p);
+#endif
+            numerics_switches = strata::core::session_env_switches(env);
+            std::vector<strata::core::SessionDevice> devs;
+            int n = 0, rt = 0;
+            if (cudaGetDeviceCount(&n) != cudaSuccess) { cudaGetLastError(); n = 0; }
+            if (cudaRuntimeGetVersion(&rt) != cudaSuccess) { cudaGetLastError(); rt = 0; }
+            for (int d = 0; d < n; ++d) {
+                cudaDeviceProp p{};
+                strata::core::SessionDevice sd;
+                if (cudaGetDeviceProperties(&p, d) == cudaSuccess) {
+                    sd.cc = 10 * p.major + p.minor;
+                    sd.sms = p.multiProcessorCount;
+                    sd.integrated = p.integrated;
+                    sd.mem_gib = (int64_t) (p.totalGlobalMem >> 30);
+                    sd.name = p.name;
+                } else {
+                    cudaGetLastError();
+                }
+                sd.runtime = rt;
+                devs.push_back(sd);
+            }
+            const auto dsw = strata::core::session_device_switches(devs);
+            numerics_switches.insert(numerics_switches.end(), dsw.begin(), dsw.end());
+            std::string names;
+            for (const auto& s : numerics_switches)
+                if (s.first.rfind("env.", 0) == 0) names += (names.empty() ? "" : " ") + s.first.substr(11);
+            std::fprintf(stderr, "strata serve: the session identity covers %d card(s) and %zu STRATA_* switch(es)%s%s\n", n,
+                         numerics_switches.size() - dsw.size(), names.empty() ? "" : ": ", names.c_str());
+        }
         auto session_identity = [&](strata::core::SessionFileIdentity& id, std::string& e,
                                     const std::function<void()>& next_file) -> bool {
             if (!model_fp) {
@@ -10586,7 +10626,9 @@ int main(int argc, char** argv) {
                     {"keep_canonical", o.keep_canonical}, {"no_fused_gr", o.no_fused_gr},
                     {"no_fast_attn", o.no_fast_attn}, {"no_fused_gdn", o.no_fused_gdn},
                     {"no_fast_select", o.no_fast_select}, {"vision", o.vision}};
+                c.switches.insert(c.switches.end(), numerics_switches.begin(), numerics_switches.end());
                 config_fp = strata::core::session_config_fingerprint(c);
+                std::fprintf(stderr, "strata serve: session config fingerprint %016llx\n", (unsigned long long) *config_fp);
             }
             id.model = *model_fp;
             id.config = *config_fp;

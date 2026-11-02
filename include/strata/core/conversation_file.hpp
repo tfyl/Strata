@@ -83,6 +83,23 @@ struct SessionConfig {
 };
 uint64_t session_config_fingerprint(const SessionConfig& config);
 
+// The kernel choice behind the saved numbers (tfyl): the engine reads ~700 STRATA_* variables, the server sets some
+// by default (0.2.9: STRATA_GDN_TC=1, STRATA_GDN_CONVL2=2 on Linux CUDA, neither bitwise) and the engine resolves
+// others from the card (the sm_120 table: STRATA_PF_FUSED on 80+ SMs, STRATA_GR_V3 over 13 GiB, ...).  So the
+// identity takes every STRATA_* variable the engine runs with - an allow list would miss the next new switch - except
+// the families that cannot change a computed number (session_env_counts), plus each visible card's identity, from
+// which the engine's own defaults follow.  An unknown variable counts: a change to it costs a cold store, never a
+// restore computed under other kernels.  `env`: "NAME=VALUE" strings (the process environment, snapshotted once
+// after the engine's own defaults are set).  Sorted by name, as "env.NAME" -> a digest of the value.
+bool session_env_counts(const std::string& name);
+std::vector<std::pair<std::string, int64_t>> session_env_switches(const std::vector<std::string>& env);
+struct SessionDevice {
+    int cc = 0, sms = 0, integrated = 0, runtime = 0;   // 10 x major + minor, SM count, an integrated GPU, the runtime
+    int64_t mem_gib = 0;                                 // total memory, whole GiB
+    std::string name;
+};
+std::vector<std::pair<std::string, int64_t>> session_device_switches(const std::vector<SessionDevice>& devices);
+
 // One model input the engine loaded and the role it plays ("native shard 1", "expert blk.3.ffn_up", ...).  The role,
 // not the path, enters the fingerprint, so a moved model folder still matches.  Every (role, file) pair counts: one
 // file in two roles is two entries (its bytes are read once).  `optional`: a missing file is recorded as absent

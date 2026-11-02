@@ -392,6 +392,65 @@ int main() {
         i.i64("n", 5); u.u64("n", 5);
         check(i.digest() != u.digest(), "identity fields are typed");
     }
+    // tfyl: the STRATA_* switches and the cards the engine runs with enter the config (session_env_switches)
+    {
+        const std::vector<std::string> env = {"PATH=/usr/bin", "STRATA_GDN_TC=1", "STRATA_GDN_CONVL2=2",
+                                              "STRATA_ROUTE_PRIOR=0", "STRATA_CACHE_MESSAGE_BOUNDARY=1",
+                                              "STRATA_ALLOWED_HOSTS=strata.example", "STRATA_DS4_SLOT_DIR=/tmp/a",
+                                              "STRATA_QSA_DUMP=1", "STRATA_API_KEY=k"};
+        SessionDevice d5070;
+        d5070.cc = 120; d5070.sms = 48; d5070.mem_gib = 11; d5070.runtime = 13010; d5070.name = "NVIDIA GeForce RTX 5070";
+        auto fp = [&](const std::vector<std::string>& e, const std::vector<SessionDevice>& devs) {
+            SessionConfig c;
+            c.engine_version = "0.1.55"; c.backend = "cuda"; c.kv = "k8v4";
+            c.switches = {{"no_ple", 0}};
+            for (const auto& s : session_env_switches(e)) c.switches.push_back(s);
+            for (const auto& s : session_device_switches(devs)) c.switches.push_back(s);
+            return session_config_fingerprint(c);
+        };
+        const uint64_t base = fp(env, {d5070});
+        check(fp(env, {d5070}) == base, "env fingerprint: the same environment and card give the same fingerprint");
+        std::vector<std::string> shuffled(env.rbegin(), env.rend());
+        check(fp(shuffled, {d5070}) == base, "env fingerprint: the order of the environment does not count");
+        const auto sw = session_env_switches(env);
+        std::vector<std::string> names;
+        for (const auto& s : sw) names.push_back(s.first);
+        check(names == std::vector<std::string>{"env.STRATA_CACHE_MESSAGE_BOUNDARY", "env.STRATA_GDN_CONVL2",
+                                                "env.STRATA_GDN_TC", "env.STRATA_ROUTE_PRIOR"},
+              "env fingerprint: the numerics switches in, hosts / keys / paths / dumps / other variables out");
+        auto with = [&](const std::string& kv) { auto e = env; e.push_back(kv); return e; };
+        auto without = [&](const std::string& name) {
+            std::vector<std::string> e;
+            for (const auto& kv : env) if (kv.rfind(name + "=", 0) != 0) e.push_back(kv);
+            return e;
+        };
+        auto replaced = [&](const std::string& name, const std::string& value) {
+            auto e = without(name);
+            e.push_back(name + "=" + value);
+            return e;
+        };
+        check(fp(replaced("STRATA_GDN_TC", "0"), {d5070}) != base, "env fingerprint: STRATA_GDN_TC=0 is another config");
+        check(fp(replaced("STRATA_GDN_CONVL2", "1"), {d5070}) != base, "env fingerprint: a CONVL2 mode is another config");
+        check(fp(without("STRATA_GDN_TC"), {d5070}) != base, "env fingerprint: an unset switch is another config");
+        check(fp(with("STRATA_PF_FUSED=1"), {d5070}) != base, "env fingerprint: STRATA_PF_FUSED=1 enters it");
+        check(fp(with("STRATA_KVA=1"), {d5070}) != base, "env fingerprint: STRATA_KVA enters it");
+        check(fp(with("STRATA_SOME_NEW_SWITCH=1"), {d5070}) != base, "env fingerprint: an unknown STRATA_ switch counts");
+        check(fp(replaced("STRATA_ALLOWED_HOSTS", "other.example"), {d5070}) == base,
+              "env fingerprint: the server's host list does not count");
+        check(fp(replaced("STRATA_DS4_SLOT_DIR", "/tmp/b"), {d5070}) == base, "env fingerprint: a folder does not count");
+        check(fp(with("STRATA_PARK_TRACE=1"), {d5070}) == base, "env fingerprint: a trace switch does not count");
+        check(fp(with("HOME=/root"), {d5070}) == base, "env fingerprint: non-STRATA variables do not count");
+        check(session_env_counts("STRATA_GDN_TC_TILES") && session_env_counts("STRATA_PREFILL_CPU_SHARE") &&
+                  !session_env_counts("STRATA_") && !session_env_counts("CUDA_VISIBLE_DEVICES"),
+              "env fingerprint: words, not substrings (TILES is not FILE)");
+        SessionDevice ti = d5070;
+        ti.sms = 70; ti.mem_gib = 15; ti.name = "NVIDIA GeForce RTX 5070 Ti";
+        check(fp(env, {ti}) != base, "device fingerprint: another card is another config (its defaults differ)");
+        SessionDevice rt = d5070;
+        rt.runtime = 13020;
+        check(fp(env, {rt}) != base, "device fingerprint: another CUDA runtime is another config");
+        check(fp(env, {d5070, d5070}) != base, "device fingerprint: the card count counts");
+    }
     // bounds a read checks before it allocates, and the caller's admission
     {
         SessionReadLimits l;

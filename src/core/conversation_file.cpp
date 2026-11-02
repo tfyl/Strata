@@ -899,6 +899,59 @@ uint64_t session_config_fingerprint(const SessionConfig& c) {
     return b.digest();
 }
 
+bool session_env_counts(const std::string& name) {
+    if (name.rfind("STRATA_", 0) != 0 || name.size() == 7) return false;
+    // where the engine writes, who may call it and what it reports: never a computed number
+    static const char* const exact[] = {"ALLOWED_HOSTS", "API_KEY", "OFFLINE", "CRASH_BT", "PAR_COUNTERS"};
+    const std::string rest = name.substr(7);
+    for (const char* e : exact)
+        if (rest == e) return false;
+    // ... and the same by word, so STRATA_DS4_SLOT_DIR or STRATA_QSA_DUMP is out but STRATA_GDN_TC_TILES is in
+    static const char* const words[] = {"LOG", "TRACE", "DUMP", "DEBUG", "DBG", "VERBOSE", "TELEMETRY", "STATS",
+                                        "DIR", "PATH", "FILE", "KEY", "SECRET", "PASSWORD"};
+    size_t at = 0;
+    while (at <= rest.size()) {
+        const size_t end = std::min(rest.find('_', at), rest.size());
+        const std::string w = rest.substr(at, end - at);
+        for (const char* x : words)
+            if (w == x) return false;
+        at = end + 1;
+    }
+    return true;
+}
+
+std::vector<std::pair<std::string, int64_t>> session_env_switches(const std::vector<std::string>& env) {
+    std::vector<std::pair<std::string, int64_t>> out;
+    for (const std::string& kv : env) {
+        const size_t eq = kv.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string name = kv.substr(0, eq);
+        if (!session_env_counts(name)) continue;
+        const std::string value = kv.substr(eq + 1);
+        out.push_back({"env." + name, (int64_t) session_hash64(value.data(), value.size(), 0x454e5631ull)});   // "ENV1"
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.first == b.first; }),
+              out.end());   // a duplicated name (a hand-built environ): the first after sorting, the same on every start
+    return out;
+}
+
+std::vector<std::pair<std::string, int64_t>> session_device_switches(const std::vector<SessionDevice>& devices) {
+    std::vector<std::pair<std::string, int64_t>> out;
+    out.push_back({"device.count", (int64_t) devices.size()});
+    for (size_t i = 0; i < devices.size(); ++i) {
+        const SessionDevice& d = devices[i];
+        const std::string p = "device." + std::to_string(i) + ".";
+        out.push_back({p + "cc", d.cc});
+        out.push_back({p + "sms", d.sms});
+        out.push_back({p + "mem_gib", d.mem_gib});
+        out.push_back({p + "integrated", d.integrated});
+        out.push_back({p + "runtime", d.runtime});
+        out.push_back({p + "name", (int64_t) session_hash64(d.name.data(), d.name.size(), 0x44455631ull)});   // "DEV1"
+    }
+    return out;
+}
+
 const char* session_error_name(SessionError e) {
     switch (e) {
         case SessionError::none: return "none";
